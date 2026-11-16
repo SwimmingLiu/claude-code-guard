@@ -261,7 +261,7 @@ launchctl print "gui/$(id -u)/com.swimmingliu.proxyguard" | sed -n '1,25p'
 ./identity.sh verify    # 只读对照实验：同一组规则，闸门外 vs 闸门内
 ./identity.sh apply     # 写入 ~/.claude/settings.json（先备份为 .proxyguard.bak）
 ./identity.sh status    # 当前闸门状态与残余通道
-./identity.sh revert    # 从备份恢复
+./identity.sh revert    # 从备份恢复；备份没了也能用（外科式撤销，只减不减用户的规则）
 ```
 
 闸门由两条互补的路径组成，缺一不可：
@@ -279,11 +279,11 @@ launchctl print "gui/$(id -u)/com.swimmingliu.proxyguard" | sed -n '1,25p'
 - **`~/Library/Preferences` 不够**：只封它，`defaults domains` 还剩 140 条，全部来自 `~/Library/Containers`（715 个 App 容器、22 GB 的第三方数据）。两个都整目录封，域名清单归零。
 - **`(allow sysctl-write)` 必须带 `(sysctl-name …)` 限定**：裸写会连 `sysctl-read` 一起放开，`hw.model`、`kern.hostname`、`machdep.cpu.brand_string`、`kern.boottime` 全部可读。二进制 2.1.325 原文就是限定到 `kern.tcsm_enable` 一条。
 - Claude 自己的身份与历史也封：`~/.claude.json`（machineID）、`~/.claude/projects`（全部历史对话）、`~/.cache/proxyguard`（`geo.json` 的 `system_tz` 写着真实时区）、`~/.ssh/id_rsa`/`id_ed25519`、`~/.gnupg`、`~/.docker/config.json`。
-- `sandbox.network.httpProxyPort` **不构成网络隔离**——Claude Code 只在设了 `allowedDomains`/`denyAllNetwork` 时才生成 `(deny network*)`。真正锁死出口的是 Clash 的 TUN（见 §四）。
-- **打开沙箱本身有代价**（都是实测的）：Keychain 用不了（`gh auth status` 报 token 无效，但 `~/Library/Keychains` 保留在 denyRead 里——数据库文件本来就该挡；要用 `GH_TOKEN`）；**git over SSH 用不了**（私钥被封，`known_hosts` 没封所以主机校验正常）；`open -a` 失败；Homebrew 的临时文件被拒；**项目 hook 不再被沙箱包裹**（上游看到 `blockReadsOutsideWorkingDirectories` 或任何 `denyRead` 就判定 `person_read_rules` 并放弃包裹）。HTTPS + token 的正常开发流程不受影响。
+- `sandbox.network.httpProxyPort` **不构成网络隔离**——只有设了 `sandbox.network.allowedDomains`，`Lj()` 才不写裸的 `(allow network*)`；`denyAllNetwork` 不是 `settings.json` 的键。真正锁死出口的是 Clash 的 TUN（见 §九）。
+- **打开沙箱本身有代价**（都是实测的）：Keychain 用不了——`~/Library/Keychains` 在 `denyRead` 里，登录钥匙串整条不可见，`gh auth status` 报 token 无效（要用 `GH_TOKEN`）；**git over SSH 用不了**（私钥被封，`known_hosts` 没封所以主机校验正常）；`open -a` 失败；Homebrew 的临时文件被拒；**项目 hook 不再被沙箱包裹**（上游看到 `blockReadsOutsideWorkingDirectories` 或任何 `denyRead` 就判定 `person_read_rules` 并放弃包裹）。HTTPS + token 的正常开发流程不受影响。
 - **不要封 `~/.config/gh/hosts.yml`**：里面没有 token（token 在 keychain），只有已经由 `$HOME` 路径暴露的用户名，而封了 `gh` 连启动都失败。
 
-**残余通道**（详见 `docs/identity-gate.md` §4）：MAC 地址（`ifconfig`）、`hostname` / `kern.hostname`（封了会打死 `ps`/`python`/`npm`）、序列号与机型名（IOKit）、`scutil --get ComputerName`（走 configd 的 XPC，不读文件），以及家目录路径本身携带的用户名。`dscl ... RealName` 已被沙箱挡住。
+**残余通道**（详见 `docs/identity-gate.md` §4）：MAC 地址（`ifconfig`）、`hostname` / `kern.hostname`（白名单具名放行；单独封它会让 `uname` / `python socket.gethostname()` 失败、`npm` 断言崩溃）、序列号与机型名（IOKit `ioreg` / `system_profiler`）、`scutil --get ComputerName`（真正来源 configd 不在 mach 白名单里，沙箱内只剩 IOKit 的机型名 `MacBook Air`），以及家目录路径本身携带的用户名。`hw.model` 走 sysctl、`hw.model` 不在白名单，沙箱内本来就是 EPERM。`dscl ... RealName` 已被沙箱挡住。
 
 `install.sh` 会把 `identity.sh` 一并安装到 `~/Library/Application Support/proxyguard/`，但**不会自动 apply**——修改 Claude Code 设置属于用户决定，安装脚本只把工具放到位并打印用法；`uninstall.sh --purge` 会先 `identity.sh revert` 再删除。
 

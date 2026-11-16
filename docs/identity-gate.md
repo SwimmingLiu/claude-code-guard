@@ -17,8 +17,8 @@ Claude Code 能读本机的东西，网络层（代理 / TUN）一点都管不�
 
 `identity.sh apply` 能写进 `settings.json` 的只有**文件路径**和**权限规则**。
 下表的三列就是这么来的：B 列是 Claude Code 官方沙箱自带的 profile（按其二进制里
-`Lj()` 逐条重建，59 条 sysctl 白名单、11 个 mach 服务、`(allow file-read*)` …），
-C 列 = B 列 + `apply` 写入的 `denyRead`。
+`Lj()` 逐条重建，50 条具名 sysctl + 10 条前缀、14 个 mach 服务、
+`(allow network*)` …），C 列 = B 列 + `apply` 写入的 `denyRead`。
 
 | 通道 | 实测读取方式 | 无沙箱 | Claude 沙箱 | 沙箱 + apply | 谁关的 |
 |---|---|---|---|---|---|
@@ -33,26 +33,29 @@ C 列 = B 列 + `apply` 写入的 `denyRead`。
 | 时区自动设置 | `plutil -extract Active raw …/com.apple.timezone.auto.plist` | `true` | `true` | **拒绝** | 同上 |
 | 定位客户端库 | `plutil -p /var/db/locationd/clients.plist` | 可读 | 可读 | **拒绝** | `denyRead /private/var/db/locationd` |
 | Wi-Fi 日志 | `cat /var/log/wifi.log` | 可读 | 可读 | **拒绝** | `denyRead /private/var/log/wifi.log` |
-| Wi-Fi 优选网络 | `networksetup -listpreferredwirelessnetworks en0` | 列表 | 报错 | 报错 | 沙箱的 mach 白名单（**不是**闸门） |
-| 机型 sysctl | `sysctl -n hw.model` | `Mac16,12` | **拒绝** | 拒绝 | 沙箱的 sysctl 白名单（`hw.model` 不在里面） |
-| 序列号 | `ioreg -l \| grep IOPlatformSerialNumber` | 1 | **1** | **1** | ✗ 残余 |
-| 机型名 | `system_profiler SPHardwareDataType` | `MacBook Air` | 同左 | 同左 | ✗ 残余 |
+| Wi-Fi 偏好文件 | `ls ~/Library/Preferences/com.apple.wifi*` | 列出 | 列出 | **不存在** | `denyRead ~/Library/Preferences` |
+| Wi-Fi 优选网络 | `networksetup -listpreferredwirelessnetworks en0` | 列表 | 失败 | 失败 | 不是闸门：该命令要 `AuthorizationCreate`，沙箱内恒失败（-60008） |
+| 机型 sysctl | `sysctlbyname("hw.model")`（`sysctl -n` 在此骨架里连允许的名字也报 `fmt` 错误，见 §2） | `Mac16,12` | **EPERM** | EPERM | 沙箱的 sysctl 白名单（`hw.model` 不在里面） |
+| 序列号 | `ioreg -l \| grep IOPlatformSerialNumber` | `LRH…` | **`LRH…`** | **`LRH…`** | ✗ 残余（IOKit） |
+| 机型名 | `system_profiler SPHardwareDataType` | `MacBook Air` / `Mac16,12` | 同左 | 同左 | ✗ 残余 |
 | MAC 地址 | `ifconfig \| grep ether` | 11 | 11 | 11 | ✗ 残余 |
-| 电脑名（XPC） | `scutil --get ComputerName` | 个人名 | 个人名 | 个人名 | ✗ 残余（走 configd，不读文件） |
-| 主机名 | `hostname` | `xxx.local` | 同左 | 同左 | ✗ 残余 |
-| 偏好域名清单 | `defaults domains \| grep -c ,` | 636 | 636 | **0** | `denyRead ~/Library/Containers` |
+| 电脑名（XPC） | `scutil --get ComputerName` | 个人名 | **`MacBook Air`**（机型名，非个人名） | 同左 | 沙箱把真正来源 configd 挡在外面，只剩 IOKit 的机型名 |
+| 主机名 | `hostname` / `kern.hostname` | `xxx.local` | **`xxx.local`** | 同左 | ✗ 残余（白名单里具名允许） |
+| 偏好域名清单 | `defaults domains \| tr ',' '\n' \| grep -c '[^[:space:]]'` | 638 | 638 | **0** | `denyRead ~/Library/Containers` |
 | proxyguard geo.json | `jq -r .system_tz ~/.cache/proxyguard/geo.json` | `Asia/Shanghai` | 同左 | **拒绝** | `denyRead ~/.cache/proxyguard` |
 | Claude machineID | `jq -r .machineID ~/.claude.json` | 值 | 同左 | **拒绝** | `denyRead ~/.claude.json` |
-| Claude 历史对话 | `ls ~/.claude/projects` | 15 | 15 | **拒绝** | `denyRead ~/.claude/projects` |
+| Claude 历史对话 | `ls ~/.claude/projects` | 18 项 | 18 项 | **拒绝** | `denyRead ~/.claude/projects` |
 | SSH 私钥 | `head -c 20 ~/.ssh/id_rsa` | 私钥头 | 同左 | **拒绝** | `denyRead ~/.ssh/id_rsa` |
 | GPG 密钥环 | `ls ~/.gnupg` | 可读 | 同左 | **拒绝** | `denyRead ~/.gnupg` |
-| 写偏好 | `defaults write …` | 可写 | **拒绝** | 拒绝 | 沙箱（cfprefsd 写不在白名单） |
+| 写偏好 | `defaults write …` | 可写 | **拒绝** | 拒绝 | 沙箱没给 `~/Library/Preferences` 的 `file-write*`（与 cfprefsd 无关，见 §2） |
+| Keychain 条目 | `security find-generic-password -s gh:github.com` | 找得到 | 找得到 | **找不到** | `denyRead ~/Library/Keychains`（`securityd.xpc` 在 mach 白名单里，见 §2） |
 
 **结论：`apply` 真正关掉的是「时区 / 语言 / 地区 / 键盘 / 位置 / Wi-Fi 日志 / 偏好域名清单」
-这一条主轴，外加 Claude 自己的 machineID、历史对话、SSH 私钥、GPG 密钥环和
-`~/Library/Containers`（第三方 App 的全部本地数据）。
+这一条主轴，外加 Claude 自己的 machineID、历史对话、SSH 私钥、GPG 密钥环、
+`~/Library/Containers`（第三方 App 的全部本地数据）和 keychain 条目。
 序列号、机型名、MAC、主机名读得到，因为它们是 IOKit / sysctl，而 `settings.json` 没有
 注入这两类规则的入口。**
+
 
 `identity.sh verify` 跑的就是这张表的 B/C 两列：两列都用按 Claude 二进制里 `Lj()`
 重建的 `(deny default)` + 白名单骨架，唯一差别是 C 列多出 apply 写入的那组 deny。
@@ -61,7 +64,7 @@ C 列 = B 列 + `apply` 写入的 `denyRead`。
 
 ---
 
-## 2. 八条曾经写错、现已实测推翻的说法
+## 2. 曾经写错、现已实测推翻的说法
 
 留在这里，防止以后有人「修回去」。
 
@@ -91,6 +94,13 @@ Claude 的 profile 是 `(deny default)`，cfprefsd **不在**它的 mach 白名�
 `identity.sh` 再封一次是冗余的——而且从 `settings.json` 也根本封不了。
 真正不能做的是**整类** `(deny sysctl-read)`：实测 `ps`、`uname`、`python platform`、
 `node`、`npm` 全挂（`LowLevelAlloc arithmetic overflow`）。
+
+**测这一行要用 `sysctlbyname()`，不能用 `sysctl -n`。** Claude 沙箱里 `/usr/sbin/sysctl`
+对**任何**名字都报 `sysctl: sysctl fmt -1 1024 1: Operation not permitted`——包括白名单里
+明写着允许的 `hw.ncpu`、`kern.ostype`。原因不是规则，而是 `sysctl` 取整张 MIB 的方式
+在这个骨架里不成立。所以「`sysctl -n hw.model` 两列都报错」证明不了闸门关掉了机型；
+`verify` 用 python 的 `ctypes.sysctlbyname("hw.model")`，才有 `Mac16,12` / `EPERM` 的对照。
+
 
 ### ✗「按大洲封 zoneinfo，就能不让它知道真实时区」
 
@@ -143,11 +153,15 @@ python3 ZoneInfo("Asia/Shanghai") → PermissionError
 
 ### ✗「`~/Library/Preferences` 一关，偏好域名就没了」
 
-只封它，`defaults domains` 从 636 条降到 **140** 条。剩下这 140 条的来源是
+只封它，`defaults domains` 从 638 条降到 **140** 条。剩下这 140 条的来源是
 `~/Library/Containers`——实测逐个排除：加封 `Group Containers`、`Application Support`、
 `Saved Application State` 都不减少，**只有封 `Containers` 才归零**。
 容器目录本来也不该让 Claude 读：715 个 App 容器、22 GB，里面是 DingTalk、WeWork
 这类第三方 App 的全部本地数据。`deny_paths()` 因此整目录封。
+
+（计数命令要用 `defaults domains | tr ',' '\n' | grep -c '[^[:space:]]'`。
+`defaults domains` 把整份清单打在**一行**里，`grep -c ,` 只数行、永远输出 1，
+不是「域名个数」——早先文档写的 636 就是这么来的一个从未实测过的数字。）
 
 ### ✗「`~/.config/gh/hosts.yml` 值得封」
 
@@ -168,6 +182,38 @@ failed to create root command: failed to read configuration:
 本机时区唯一的路就是 `/etc/localtime` 那个符号链接。封掉之后闸门内
 `env -u TZ date` 输出 `UTC +0000`，而允许读 localtime 的对照组输出 `CST +0800`——
 对照组证明这个测试骨架是有效的，不是「什么都测不出来」。
+
+### ✗「`defaults write` 被挡是因为 cfprefsd 不在白名单」
+
+cfprefsd 确实不在白名单里（profile 里 `grep -c cfprefsd` = 0），但**那不是原因**：
+把骨架原样加上一条 `(allow file-write* (subpath "~/Library/Preferences"))`，
+`defaults write` 立刻成功并在磁盘上写出 `.plist`——说明 `defaults` 本来就在直读直写
+文件，只是 profile 没给这个目录**任何**写权限。同理，读能成功也不是靠 XPC。
+
+### ✗「`gh` 取不到 token 是因为 `securityd.xpc` 不在白名单」
+
+`com.apple.securityd.xpc` **在** `Lj()` 的 14 个具名 mach 服务里（`SecurityServer`
+另有一条）。闸门内 keychain 失效的真正原因是 `~/Library/Keychains` 被 `denyRead`
+封了——`security list-keychains` 在闸门内只剩 `/Library/Keychains/System.keychain`，
+登录钥匙串整条消失；而 `securityd.xpc` 的 mach 通道一直是通的。
+
+（实测：`security find-generic-password -s gh:github.com` 在官方沙箱里能找到条目，
+加上 `~/Library/Keychains` 的 deny 后报「找不到」；`gh auth status` 同上，
+从 `✓ Logged in … (keyring)` 变成 `X Failed to log in … (default)`。）
+
+### ✗「`ps` 在沙箱里失败是因为 `kern.hostname` 被白名单放行 / 被 deny」
+
+两条都不成立。`/bin/ps` 是 **setuid root**（`-rwsr-xr-x`）：seatbelt 拒绝在沙箱内
+exec 一个 setuid 程序，所以 `/bin/ps` 连启动都不行（`execvp() … Operation not permitted`），
+跟 sysctl 规则毫无关系——把 profile 里所有 `process-info*` 规则删掉，`/bin/ps` 照样失败，
+而同一个二进制去掉 setuid 位拷一份就能跑。
+
+同理，**`kern.hostname` 不是「封了就打死 `ps`/`python`/`npm`」那个开关**（那是整类
+`(deny sysctl-read)` 的后果）。单独 `(deny sysctl-read (sysctl-name "kern.hostname"))` 的
+实测代价是：`uname -a` 报错、`hostname` 报错、`python socket.gethostname()` 抛
+`PermissionError`、`npm --version` **断言崩溃**（`node_os.cc` 的 `os.hostname()`）；
+`node`、`git`、`gh`、`curl`、`python3 -c 'print(1)'` 全部正常。因为 `npm` 会崩，
+闸门不封它，`hostname` 仍列为残余通道。
 
 ---
 
@@ -218,8 +264,8 @@ seatbelt 是**后 match 者胜**，所以第三条会不会重开闸门，全看
 |---|---|---|
 | 序列号（`ioreg -l`） | IOKit，`settings.json` 注入不了 `(deny iokit-get-properties)` | 用 seatbelt 包装脚本启动 `claude` 可以封，但**外层一旦带 deny，Claude 自己的内层沙箱就 `sandbox_apply: Operation not permitted`**，所有 Bash 命令失效——两条路不共存 |
 | 机型名 / MAC | 同上（`system_profiler`、`ifnet`） | 同上 |
-| 主机名（`kern.hostname`） | 封它会打死 `ps`、`python`、`node`、`npm`（实测 `PermissionError` / 崩溃） | 不可接受 |
-| 电脑名（`scutil --get ComputerName`） | 走 configd 的 XPC，**不读** `/Library/Preferences` 里的文件，所以文件 deny 拦不住；而 configd 默认就在 Claude 沙箱的 mach 白名单可达范围内 | 无文件层入口 |
+| 主机名（`kern.hostname`） | 单独封它的实测代价：`uname -a` / `hostname` / `python socket.gethostname()` 失败，**`npm` 断言崩溃** | 不可接受 |
+| 电脑名（`scutil --get ComputerName`） | 真正来源 configd **不在** `Lj()` 的 mach 白名单里，沙箱内这个命令只剩 IOKit 的机型名（`MacBook Air`），读不到个人名 | — |
 | `dscl ... RealName` | 沙箱已让它失败（opendirectoryd 白名单只有 libinfo/membership） | — |
 | 用户名（家目录路径、`ls -l` 属主） | 路径天然带用户名 | 改名 / 换家目录 |
 
@@ -235,9 +281,14 @@ seatbelt 是**后 match 者胜**，所以第三条会不会重开闸门，全看
 （Las Vegas, Nevada, US）→ `America/Los_Angeles`，闸门内 `date` 稳定输出 `PST -0800`。
 
 `sandbox.network.httpProxyPort=7897` 让沙箱内进程的 `HTTPS_PROXY` 指向本机 Clash，
-**但它不构成网络隔离**：Claude Code 只有在设置了 `allowedDomains` 或 `denyAllNetwork`
-时才会生成 `(deny network*)`，否则 profile 里是 `(allow network*)`。真正的出口锁定
-来自 Clash 的 TUN（见 README §四）。
+**但它不构成网络隔离**：只有当 `sandbox.network.allowedDomains` 被设置时，
+`Lj()` 才不写 `(allow network*)`；否则 profile 里就是裸的 `(allow network*)`。
+（`denyAllNetwork` 不是 `settings.json` 的键——它是 SDK 的 per-exec 选项，
+`Lj()` 收到的 `needsNetworkRestriction` 来自 `allowedDomains` / SDK 入参两条路。
+全部合法的 `sandbox.network` 键只有 `allowedDomains`、`deniedDomains`、
+`allowUnixSockets`、`allowAllUnixSockets`、`allowLocalBinding`、`allowMachLookup`、
+`httpProxyPort`、`socksProxyPort`、`allowManagedDomainsOnly`、`strictAllowlist`。）
+真正的出口锁定来自 Clash 的 TUN（见 README §九）。
 
 ---
 
@@ -248,6 +299,8 @@ seatbelt 是**后 match 者胜**，所以第三条会不会重开闸门，全看
 - **Go 写的 CLI 无法校验证书**：沙箱的 mach 白名单没有 `com.apple.trustd.agent`，
   `gh api`、`gcloud`、`terraform`、`kubectl` 报 `x509: OSStatus -26276`。
   `apply` 会把 `trustd.agent` 加进 `sandbox.network.allowMachLookup`（旧版本可能忽略该键）。
+  注意 `Lj()` 只在 `enableWeakerNetworkIsolation` 启用时才自带这一条，所以显式写进
+  `allowMachLookup` 是必要的。
 - **项目 hook 不再被沙箱包起来**：Claude Code 的 hook 沙箱（`ftn()`/`mtn()`）在
   `HQe()` 里一旦看到 `blockReadsOutsideWorkingDirectories` 或任何 `denyRead` /
   `Read(...)` deny，就判定 `person_read_rules` 并**放弃包裹**，hook 直接以普通进程运行。
@@ -256,12 +309,14 @@ seatbelt 是**后 match 者胜**，所以第三条会不会重开闸门，全看
   不是闸门的 bug；但要知道它发生了。
 - **`git over SSH` 用不了**：`~/.ssh/id_rsa` / `id_ed25519` 被封，`Permission denied (publickey)`。
   `known_hosts` 没封，所以主机校验不受影响。HTTPS + token 完全不受影响。
-- **`gh` 能启动但 token 取不到**：keychain 里的 token 在沙箱内取不到（`securityd.xpc` 不在白名单），
-  `gh auth status` 报 `The token in default is invalid`。用 `GH_TOKEN` 环境变量。
+- **`gh` 能启动但 token 取不到**：`~/Library/Keychains` 的 `denyRead` 让登录钥匙串整条
+  不可见（`security list-keychains` 只剩系统钥匙串），`gh auth status` 报
+  `The token in default is invalid`。要用 `GH_TOKEN` 环境变量。
   （**不要**去封 `~/.config/gh/hosts.yml`——封了 `gh` 连启动都失败，而它里面没有 token，见 §2。）
-- **Keychain 用不了**：`security find-generic-password` 被拒（`securityd.xpc` 不在白名单）。
-  `~/Library/Keychains` 仍保留在 `denyRead` 里——keychain 数据库文件在沙箱内本来就可读，
-  这是真正需要挡住的东西。
+- **Keychain 用不了**：`security find-generic-password` 在闸门内找不到条目
+  （原因同样是 `~/Library/Keychains` 的 `denyRead`，**不是** mach 白名单：
+  `com.apple.securityd.xpc` 一直在里面，见 §2）。这条 deny 是刻意的——钥匙串数据库
+  文件在官方沙箱里本来就可读，闸门要挡的正是这个。
 - **`open -a App` 失败**（-10810），`osascript` 可用。
 - **Homebrew** 的 here-doc 临时文件被拒（沙箱缺 `TMPDIR` 写权限，与闸门无关）。
 - **封 `~/Library/Containers` 之后**，沙箱里的 App 容器数据一律读不到；
@@ -277,10 +332,19 @@ seatbelt 是**后 match 者胜**，所以第三条会不会重开闸门，全看
 ./identity.sh verify    # 只读对照实验：同一份 denyRead，闸门外 vs 闸门内
 ./identity.sh apply     # 写入 ~/.claude/settings.json（自动备份为 .proxyguard.bak）
 ./identity.sh status    # 查看当前闸门与残余通道
-./identity.sh revert    # 从备份恢复
+./identity.sh revert    # 从备份恢复；备份没了也能用（外科式撤销）
 ```
+
+`revert` 优先用备份整份恢复。备份是用户可以随手删掉的 dotfile，所以没有备份时它不会
+罢工：用**同一套生成器**算出 `apply` 加进去的那些条目（denyRead / `Read(...)` /
+`Bash(...)` / `env.TZ`·`LANG`·`LC_ALL`），逐条减掉，用户原有的规则一条不动
+（对每条路径的「带 `/**`」和「不带」两种形态都减，所以 `~/.cache/proxyguard` 已被删掉时
+也清得干净）。沙箱开关类键（`enabled` / `failIfUnavailable` / `allowUnsandboxedCommands`
+等）分不清是不是 `apply` 设的，保留——它们不泄露身份，方向也是更安全的一侧。
 
 `install.sh` 会把 `identity.sh` 一并安装到
 `~/Library/Application Support/proxyguard/`，但**不会自动 apply**——
 修改 Claude Code 设置属于用户决定，安装脚本只负责把工具放到位并打印用法。
-`uninstall.sh --purge` 会先 `revert` 再删除。
+`uninstall.sh --purge` 会先 `identity.sh revert`；只有在**确认**闸门已关掉之后才删除
+`$DEST`。关不掉时（没有备份、没有 `identity.sh`、jq 缺失）它保留工具并打印手工关闭的
+步骤，而不是报一个没发生过的「已清除」。

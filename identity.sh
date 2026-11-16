@@ -45,8 +45,6 @@ DEST_DIR="$(cd "$(dirname "$0")" && pwd)"
 SETTINGS="$HOME/.claude/settings.json"
 BACKUP="$SETTINGS.proxyguard.bak"
 CONFIG="${PROXYGUARD_CONFIG:-$DEST_DIR/config.env}"
-STATE_DIR="${STATE_DIR:-$HOME/.cache/proxyguard}"
-GEO_FILE="$STATE_DIR/geo.json"
 MODE="${1:-status}"
 
 PROXY_HOST=127.0.0.1
@@ -56,14 +54,56 @@ if [ -f "$CONFIG" ]; then
   . "$CONFIG" >/dev/null 2>&1 || true
 fi
 
+# STATE_DIR 必须在 source config.env **之后**求值：config.env 是文档里公开可改的
+# （README §五），geo.sh / guard.sh 也都先 source 再算路径。早求值会让本脚本去读
+# 默认目录的 geo.json，而 geo.sh 写的是自定义目录——闸门于是可能按一个过期的
+# 时区启用，那正是闸门要防的「时钟与出口不一致」。
+STATE_DIR="${STATE_DIR:-$HOME/.cache/proxyguard}"
+GEO_FILE="$STATE_DIR/geo.json"
+
 say()  { printf 'identity: %s\n' "$*"; }
 die()  { printf 'identity: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "需要 $1"; }
 need jq
 
+# 跟随符号链接链，返回最终的真实文件路径。dotfiles 仓库里很常见
+# `~/.claude/settings.json -> ~/dotfiles/claude/settings.json`；用 mv 覆盖这个路径
+# 会把**链接本身**换成普通文件，dotfiles 里的源文件永远拿不到闸门，下次重链时
+# 闸门就静默丢了。geo.sh 同样跟随（geo.sh 的 settings_target 循环）。
+# 用 while 而不是 readlink -f：macOS 的 readlink 没有 -f。
+resolve_symlinks() {
+  local p=$1 link
+  local hops=0
+  while [ -L "$p" ]; do
+    hops=$((hops+1))
+    [ "$hops" -le 40 ] || return 1
+    link=$(readlink "$p" 2>/dev/null) || return 1
+    [ -n "$link" ] || return 1
+    case "$link" in
+      /*) p=$link ;;
+      *)  p=$(dirname "$p")/$link ;;
+    esac
+  done
+  printf '%s\n' "$p"
+}
+
 ip_tz() {
   [ -f "$GEO_FILE" ] || return 1
   jq -r '.timezone // empty' "$GEO_FILE" 2>/dev/null
+}
+
+# geo.json 里的时区必须同时满足两件事：字符集干净（挡住把引号/括号塞进
+# settings.json 或 seatbelt 的表达），且**真的存在于 zoneinfo**。
+# 早期版本只查「必须带大洲前缀」，结果两头都错：UTC / Japan / Hongkong / GB
+# 这些 geo.sh 认可、zoneinfo 里真实存在的名字被拒；而 "Foo/Bar" 这种不存在的
+# 名字被接受，TZ=Foo/Bar 静默退化成 UTC——正是闸门要防的「时钟与出口不一致」。
+valid_tz() {
+  local t=$1
+  case "$t" in
+    ''|/*|*/|*..*) return 1 ;;
+    *[!A-Za-z0-9_/+-]*) return 1 ;;
+  esac
+  [ -f "/usr/share/zoneinfo/$t" ]
 }
 
 # denyRead 清单：seatbelt 判定的真实路径。
@@ -79,6 +119,9 @@ ip_tz() {
 # ~/Library/Containers 同理整目录：`defaults domains` 在只封了 Preferences 之后
 # 仍有 140 条，来源就是这里（实测封 Group Containers / Application Support /
 # Saved Application State 都不减少，只有封 Containers 才归零）。
+#
+# ⚠️ 路径不要带通配符：seatbelt 的 literal/subpath 都不展开 glob，这里按真实路径
+# 写死。轮转日志要在 read_deny_rules() 和 verify 里单独用 glob 处理。
 deny_paths() {
   cat <<'EOF'
 /private/etc/localtime
@@ -121,46 +164,49 @@ EOF
 
 # Read/Grep/Glob 工具绕过 Bash 沙箱（官方文档明说），必须再写一遍权限规则，
 # 否则 Claude 用内置 Read 就能把沙箱挡住的东西读回来。
+#
+# **这里的清单必须和 deny_paths() 逐条对应**，因为 Claude Code 的 sandbox 配置
+# 构建器会把 permissions.deny 里的每条 Read(...) 折进**同一份** denyRead
+# （2.1.325 的 `zT(de?.permissions?.deny,[dt,Be])` → `case"read": Ct.push(yn)`），
+# 这里多写一条，Bash 沙箱就多封一条。
+#
+# 早先这里多写了 `Read(//private/var/db/timezone/**)`，而 zoneinfo 是 TZ 注入的
+# 唯一来源：实测那条一加，闸门内 `TZ=America/Los_Angeles date` 从 `PST -0800`
+# 变成 `UTC +0000`、python `ZoneInfo()` 直接抛 ZoneInfoNotFoundError——闸门赖以
+# 成立的「时间与出口 IP 一致」被自己的 Read 规则打掉了。已删除，别再写回去。
 read_deny_rules() {
-  cat <<'EOF'
-Read(//etc/localtime)
-Read(//private/etc/localtime)
-Read(//private/var/db/timezone/**)
-Read(//private/var/db/locationd/**)
-Read(//private/var/log/wifi.log)
-Read(//private/var/db/.AppleSetupDone)
-Read(//Library/Preferences/**)
-EOF
-  cat <<EOF
-Read(~/Library/Preferences/**)
-Read(~/Library/Containers/**)
-Read(~/Library/Caches/com.apple.locationd/**)
-Read(~/Library/Caches/com.apple.geod/**)
-Read(~/Library/Application Support/AddressBook/**)
-Read(~/Library/Application Support/CallHistoryDB/**)
-Read(~/Library/Application Support/com.apple.sharedfilelist/**)
-Read(~/Library/Messages/**)
-Read(~/Library/Mail/**)
-Read(~/Library/Calendars/**)
-Read(~/Library/Safari/**)
-Read(~/Library/Keychains/**)
-Read(~/Library/IdentityServices/**)
-Read(~/.CFUserTextEncoding)
-Read(~/.netrc)
-Read(~/.cache/proxyguard/**)
-Read(~/.gnupg/**)
-Read(~/.ssh/id_rsa)
-Read(~/.ssh/id_ed25519)
-Read(~/.docker/config.json)
-Read(~/.claude.json)
-Read(~/.claude/projects/**)
-Read(~/.claude/sessions/**)
-Read(~/.claude/history.jsonl)
-Read(~/.claude/debug/**)
-Read(~/.claude/keysmith/**)
-Read(~/.claude/daemon/**)
-Read(~/.claude/file-history/**)
-EOF
+  local p
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    # 目录要带 /**：Read() 是路径模式匹配，`Read(~/Library/Preferences)` 只挡住
+    # 目录本身。denyRead 那边无所谓——Sy() 会把尾部 /** 剥掉
+    # （`function Sy(e){return e.replace(/\/\*\*$/,"")||"/"}`），所以两种写法
+    # 在 Bash 沙箱里等价，Read 工具侧则需要 / ** 才覆盖内容。
+    [ -d "$p" ] && p="$p/**"
+    case "$p" in
+      "$HOME"/*) printf 'Read(~%s)\n' "${p#"$HOME"}" ;;
+      /*)        printf 'Read(/%s)\n' "$p" ;;
+    esac
+  done < <(deny_paths)
+}
+
+# 撤销专用的「可能形态全集」：apply 写进去的是当时 `[ -d ]` 的形态，而 revert
+# 往往发生在目录已被删掉之后（比如 ~/.cache/proxyguard 被清理）。届时
+# read_deny_rules 只会产出不带 /** 的形态，减不掉当初写的 `Read(~/.../** )`，
+# 于是闸门留下一条永远减不掉的残留规则。这里对每条路径两种形态都发，只用于
+# **减法**，不影响 apply 写进去的内容。
+read_deny_rules_all() {
+  local p base
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    base=${p%/}
+    for p in "$base" "$base/**"; do
+      case "$p" in
+        "$HOME"/*) printf 'Read(~%s)\n' "${p#"$HOME"}" ;;
+        /*)        printf 'Read(/%s)\n' "$p" ;;
+      esac
+    done
+  done < <(deny_paths)
 }
 
 # iokit / sysctl 这些通道 denyRead 表达不了，只能靠「对话内」的 Bash 规则挡一层。
@@ -184,6 +230,7 @@ EOF
 #   (allow file-read*)                      ← 先全开
 #   (deny file-read* …)  ← 你写的 denyRead   ← 再逐条关
 #   (allow file-read* …) ← allowWithinDeny   ← 最后按 filesystem.allowRead 重开
+#   (allow file-read-metadata (vnode-type DIRECTORY))  ← 仅当 denyRead 非空
 # seatbelt 是「后 match 者胜」，所以结尾那组 allow 会不会把闸门重新打开，
 # 全看 allowWithinDeny 装了什么。2.1.325 的实测答案：
 #   · 普通 Bash 走 vY()→DPo({readConfig})，allowWithinDeny 只来自
@@ -196,23 +243,63 @@ EOF
 #     项目 hook 干脆**不加沙箱**——所以 epr 永远轮不到生效。
 # 也就是说：这里只该有路径 deny。别再往里加 iokit/sysctl 规则，Claude Code 不会
 # 从 settings.json 读它们，加了只会让 verify 说谎。
+
+# 单条路径 → 一条 SBPL deny，**与 2.1.325 的 Xa() 完全一致**：
+#   function Xa(e){ return e.glob ? `(regex ${…})` : `(subpath ${…})` }
+# 生产里 **从不发 (literal …)**。早先按 [ -d ] 决定 literal/subpath 是错的：
+# 那让 verify 在「目录还不存在」或「路径是文件」时比生产更严/更松，测的不是生产。
+sbpl_deny() {
+  case "$1" in
+    /private/var/log/wifi.log)
+      # 唯一需要覆盖整族的条目。生产里 Dj() 把含 * ? [ ] 的条目判为 glob 并发
+      # (regex …)（bc() → Xa()），这里手写等价正则，一次封掉 live + 全部轮转。
+      # （deny_paths() 里不放通配符：seatbelt 不展开 glob，且会凭空多出规则。）
+      printf '(deny file-read* (regex #"^/private/var/log/wifi\\.log($|\\.[0-9]+\\.bz2$)"))\n' ;;
+    *)
+      # 与 2.1.325 的 Xa() 一致：非 glob 一律 (subpath …)，生产里从不发 (literal …)。
+      printf '(deny file-read* (subpath "%s"))\n' "$1" ;;
+  esac
+}
+
 seatbelt_rules() {
   local p n=0
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     n=$((n+1))
-    # 目录必须用 subpath，否则只挡住这个目录本身、拦不住里面的文件
-    if [ -d "$p" ]; then
-      printf '(deny file-read* (subpath "%s"))\n' "$p"
-    else
-      printf '(deny file-read* (literal "%s"))\n' "$p"
-    fi
+    sbpl_deny "$p"
   done < <(deny_paths)
   # 与 Dj() 一致：denyRead 非空时，**在 deny 之后**再放开「目录自身元数据」。
   # 这是 Claude 官方沙箱本来就有的行为，不是闸门的漏洞——它让 ls/stat 目录能过，
   # 但里面的文件仍被 deny 挡住。verify 必须原样复现，否则测的不是生产。
   [ "$n" -gt 0 ] && printf '(allow file-read-metadata (vnode-type DIRECTORY))\n'
   return 0
+}
+
+# permissions.deny 里的每条 Read(...) 也会被折进**同一份** denyRead
+# （`case"read": Ct.push(yn)`），也就是 Read 规则会额外收紧 Bash 沙箱。
+# 所以 verify 的「沙箱 + apply」列必须把这一组也发出来，否则测的只是
+# filesystem.denyRead 那一半，而生产是两半的并集。
+# 早先 verify 只发 deny_paths()，于是那条 `Read(//private/var/db/timezone/**)`
+# 在真实 apply 后把 zoneinfo 封了、TZ 静默变 UTC，verify 却仍然全绿。
+read_rule_rules() {
+  local r p
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    # Read(//abs/path) → /abs/path ；Read(~/rel) → $HOME/rel
+    p=${r#Read(}
+    p=${p%\)}
+    p=${p#\(}
+    # 与 Sy() 一致：`function Sy(e){return e.replace(/\/\*\*$/,"")||"/"}`。
+    # Read() 侧的 `/**` 在折进 denyRead 时会被剥掉，否则会变成
+    # (subpath "…/**")——那是字面星号，一个文件都匹配不到。
+    p=${p%'/**'}
+    [ -n "$p" ] || p="/"
+    case "$p" in
+      //*) p=${p#/} ;;          # //private/x → /private/x（去掉一个 /）
+      '~/'*) p="$HOME/${p#'~/'}" ;;
+    esac
+    sbpl_deny "$p"
+  done < <(read_deny_rules)
 }
 
 # verify 用的骨架：按 Claude Code 2.1.325 的 Lj() 重建（deny default + 白名单）。
@@ -226,6 +313,7 @@ claude_profile() {
 (allow process-fork)
 (deny process-info* (with message "identity-verify"))
 (allow process-info* (target same-sandbox))
+(if (defined? 'process-info-listpids) (allow process-info-listpids))
 (allow signal (target same-sandbox))
 (allow mach-priv-task-port (target same-sandbox))
 (allow user-preference-read)
@@ -314,7 +402,12 @@ claude_profile() {
   (sysctl-name-prefix "kern.proc.pgrp.")
   (sysctl-name-prefix "kern.proc.pid.")
   (sysctl-name-prefix "machdep.cpu.")
-  (sysctl-name-prefix "net.routetable.")
+  (sysctl-name-prefix "net.routetable."))
+;; Lj() 在这里**先关掉** allow sysctl-read，再单独发一条 deny：
+;;   lo("deny",["sysctl-read"],new Set(['(sysctl-name-prefix "kern.procargs")']),Y)
+;; procargs 若能读，就能拿别的进程的 KERN_PROCARGS2（argv）。早先把它写在上面
+;; 那条 allow 的括号里，等于把 deny 吃掉，verify 会谎报「argv 可读」。
+(deny sysctl-read
   (sysctl-name-prefix "kern.procargs"))
 ;; V8 thread calculations 要写 sysctl。**必须带 (sysctl-name …) 限定**：
 ;; 裸写 (allow sysctl-write) 会把 sysctl-read 一起放开（seatbelt 里 write 蕴含
@@ -351,16 +444,11 @@ EOF
 apply() {
   local tz; tz=$(ip_tz) || die "读不到出口 IP 时区（$GEO_FILE）；先让 geo.sh 跑一次，闸门拒绝在未知时区下启用"
   [ -n "$tz" ] || die "geo.json 没有 timezone 字段"
-  case "$tz" in
-    *[!A-Za-z0-9_/+-]*) die "geo.json 的 timezone 不可信: $tz" ;;
-    /*|*..*|*/)         die "geo.json 的 timezone 不可信: $tz" ;;
-  esac
-  case "$tz" in
-    */*) ;;
-    *) die "geo.json 的 timezone 缺少大洲前缀: $tz" ;;
-  esac
+  valid_tz "$tz" || die "geo.json 的 timezone 不可信或不存在: $tz"
   [ -f "$SETTINGS" ] || die "找不到 $SETTINGS"
-  [ -f "$BACKUP" ] || cp -p "$SETTINGS" "$BACKUP" || die "备份失败"
+  settings_target=$(resolve_symlinks "$SETTINGS")
+  [ -n "$settings_target" ] || die "无法解析 $SETTINGS 的符号链接"
+  [ -f "$BACKUP" ] || cp -p "$settings_target" "$BACKUP" || die "备份失败"
 
   local deny_json read_json bash_json
   deny_json=$(deny_paths      | jq -R . | jq -s 'map(select(length>0))')
@@ -372,15 +460,17 @@ apply() {
   # allowMachLookup 里的 trustd.agent 是 Go CLI（gh / gcloud / kubectl / terraform）
   # 校验证书用的：Claude 的 mach 白名单没有它，Go 程序一律 x509 OSStatus -26276。
   # 这个键对用户 settings 生效（高权限键，只被 project/local settings 限制）。
-  local proxy_json='{}'
+  #
+  # ⚠️ 所有数组都要 union，不能靠对象合并：jq 的 `+` 在对象上是浅合并，同名数组
+  # 整段替换。早先 allowMachLookup 折在 $px 里，用户原有的 mach 授权会被静默删光。
+  local proxy_port='null'
   if [ "$PROXY_HOST" = "127.0.0.1" ] && [ -n "$PROXY_PORT" ]; then
-    proxy_json=$(jq -n --argjson p "$PROXY_PORT" \
-      '{httpProxyPort:$p, allowMachLookup:["com.apple.trustd.agent"]}')
+    proxy_port="$PROXY_PORT"
   fi
 
-  local tmp="$SETTINGS.identity.$$"
+  local tmp="$settings_target.identity.$$"
   if ! jq --argjson deny "$deny_json" --argjson rd "$read_json" \
-          --argjson bd "$bash_json" --argjson px "$proxy_json" --arg tz "$tz" '
+          --argjson bd "$bash_json" --argjson port "$proxy_port" --arg tz "$tz" '
       .env = (.env // {})
       | .env.TZ     = $tz
       | .env.LANG   = "en_US.UTF-8"
@@ -392,14 +482,27 @@ apply() {
       | .sandbox.autoAllowBashIfSandboxed = false
       | .sandbox.filesystem = (.sandbox.filesystem // {})
       | .sandbox.filesystem.denyRead = (((.sandbox.filesystem.denyRead // []) + $deny) | unique)
-      | .sandbox.network = ((.sandbox.network // {}) + $px + {allowLocalBinding:true})
+      | .sandbox.network = (.sandbox.network // {})
+      | (if $port == null then . else .sandbox.network.httpProxyPort = $port end)
+      | .sandbox.network.allowMachLookup =
+          (((.sandbox.network.allowMachLookup // []) + ["com.apple.trustd.agent"]) | unique)
+      # allowLocalBinding 只在**没有**显式设过时才补 true。用户明确关了它
+      # 就是不要沙箱内进程 listen 本地端口，静默翻回 true 是替他做相反的决定。
+      | (if .sandbox.network.allowLocalBinding == null
+         then .sandbox.network.allowLocalBinding = true else . end)
       | .permissions = (.permissions // {})
       | .permissions.blockReadsOutsideWorkingDirectories = true
       | .permissions.deny = (((.permissions.deny // []) + $rd + $bd) | unique)
-    ' "$SETTINGS" > "$tmp"; then
+    ' "$settings_target" > "$tmp"; then
     rm -f "$tmp"; die "写入失败（jq 退出非零）"
   fi
-  chmod 600 "$tmp" && mv -f "$tmp" "$SETTINGS" || { rm -f "$tmp"; die "替换失败"; }
+  # jq 对**空输入**视作零个文档、退出 0 且不输出任何东西——于是一个 0 字节的
+  # settings.json 会让上面「成功」，再把 0 字节装回去并报告「已启用」。必须显式
+  # 校验输出非空且是合法 JSON，否则宁可 die 也不写。
+  if [ ! -s "$tmp" ] || ! jq -e . "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"; die "jq 输出为空或不是合法 JSON（$SETTINGS 可能已损坏）；未改动任何文件"
+  fi
+  chmod 600 "$tmp" && mv -f "$tmp" "$settings_target" || { rm -f "$tmp"; die "替换失败"; }
 
   say "已启用：IP 时区 $tz；sandbox denyRead $(printf '%s' "$deny_json" | jq length) 条；权限 deny $(printf '%s' "$read_json$bash_json" | jq -s 'add|length') 条"
   say "备份：$BACKUP"
@@ -409,11 +512,24 @@ apply() {
 
 verify() {
   need sandbox-exec
-  need python3
-  local tz; tz=$(ip_tz) || tz="America/Los_Angeles"
+  need python3   # CHECKS 里有 python 时区名一行
+  local tz tz_source
+  if tz=$(ip_tz) && [ -n "$tz" ]; then
+    tz_source="geo.json（出口 IP）"
+  else
+    # 不能假装有一个「IP 时区」。早先这里回落成作者机器的 America/Los_Angeles
+    # 再在页脚断言「闸门内 TZ 应等于 IP 时区」，于是在根本没有 geo.json 的状态
+    # 下制造出一条通过的结论——而那正是 apply 会拒绝启用的状态。
+    tz="UTC"
+    tz_source="无 geo.json，用合成值 UTC（不是 IP 时区，本行不代表一致性）"
+  fi
   VERIFY_PROF=$(mktemp "${TMPDIR:-/tmp}/identity-verify.XXXXXX") || die "mktemp 失败"
-  trap 'rm -f "${VERIFY_PROF:-}"' EXIT
-  { claude_profile; echo ';; --- identity gate (from settings.json denyRead) ---'; seatbelt_rules; } > "$VERIFY_PROF"
+  trap 'rm -f "${VERIFY_PROF:-}" "${VERIFY_PROF:-}.base"' EXIT
+  { claude_profile; echo ';; --- identity gate: filesystem.denyRead + permissions.deny Read(...) 的并集，与 apply 写出的一致 ---'
+    seatbelt_rules
+    read_rule_rules
+    echo ';; --- /identity gate ---'
+  } > "$VERIFY_PROF"
 
   # 两列都用同一份 Claude 沙箱骨架：闸门外 = 官方默认，闸门内 = 加上 apply 的
   # denyRead。这样这一列差值就是 apply 真正带来的变化。
@@ -425,12 +541,10 @@ verify() {
   printf '%-24s %-22s %s\n' "通道" "Claude 沙箱" "沙箱 + apply"
   printf '%-24s %-22s %s\n' "----------------------" "--------------------" "--------------------"
   local row label cmd base gate
-  while IFS='|' read -r label cmd; do
-    [ -n "$label" ] || continue
-    base=$(env -i HOME="$HOME" PATH="$PATH" TZ="$tz" sandbox-exec -f "$base_prof" /bin/sh -c "$cmd" 2>&1 | head -1 | tr '\t' ' ')
-    gate=$(env -i HOME="$HOME" PATH="$PATH" TZ="$tz" sandbox-exec -f "$VERIFY_PROF" /bin/sh -c "$cmd" 2>&1 | head -1 | tr '\t' ' ')
-    printf '%-24s %-22s %s\n' "$label" "$(cut -c1-22 <<<"${base:-—}")" "$(cut -c1-34 <<<"${gate:-—}")"
-  done <<'CHECKS'
+  # CHECKS 是 quoted heredoc，里面的 $HOME/$GEO_FILE 不会被本 shell 展开。行内
+  # 因此用占位符，执行前再替换成真实路径——否则 `jq ... "$GEO_FILE"` 会在
+  # 子 shell 里拿到空变量、两列都报「Could not open file」，那一行永远测不出东西。
+  local cmds; cmds=$(sed "s|GEO_FILE_PATH|$GEO_FILE|g; s|\$HOME|$HOME|g" <<'CHECKS'
 TZ 显示|date "+%Z %z"
 系统时区链接|readlink /etc/localtime || echo 空
 读 localtime|cat /etc/localtime >/dev/null 2>&1 && echo 可读 || echo 拒绝
@@ -442,27 +556,39 @@ AppleLocale|defaults read -g AppleLocale 2>&1 | tail -1
 配对蓝牙名|plutil -p /Library/Preferences/com.apple.bluetooth.plist 2>&1 | grep -c BSDName
 时区自动设置|plutil -extract Active raw /Library/Preferences/com.apple.timezone.auto.plist 2>&1 | tail -1
 定位客户端库|plutil -p /var/db/locationd/clients.plist >/dev/null 2>&1 && echo 可读 || echo 拒绝
-Wi-Fi 日志|cat /var/log/wifi.log >/dev/null 2>&1 && echo 可读 || echo 拒绝
-Wi-Fi 优选网络|networksetup -listpreferredwirelessnetworks en0 2>&1 | sed -n 2p
-机型 hw.model|sysctl -n hw.model 2>&1
+Wi-Fi 日志|cat /var/log/wifi.log /var/log/wifi.log.0.bz2 >/dev/null 2>&1 && echo 可读 || echo 拒绝
+Wi-Fi 偏好文件|ls $HOME/Library/Preferences/com.apple.wifi* 2>&1 | head -1
+机型 hw.model|python3 -I -c 'import ctypes;l=ctypes.CDLL(None,use_errno=True);b=ctypes.create_string_buffer(64);n=ctypes.c_size_t(64);print(b.value.decode() if l.sysctlbyname(b"hw.model",b,ctypes.byref(n),None,0)==0 else "EPERM")' 2>&1
 序列号 ioreg|ioreg -l 2>/dev/null | grep -c IOPlatformSerialNumber
 MAC 地址数|ifconfig 2>/dev/null | grep -c ether
 电脑名|scutil --get ComputerName 2>&1
 home 偏好域名数|defaults domains 2>/dev/null | tr ',' '\n' | grep -c '[^[:space:]]'
-geo.json 系统时区|jq -r .system_tz "$HOME/.cache/proxyguard/geo.json" 2>&1 | tail -1
-Claude machineID|jq -r .machineID "$HOME/.claude.json" 2>&1 | cut -c1-12
-Claude 历史目录|ls "$HOME/.claude/projects" 2>&1 | wc -l
-SSH 私钥|head -c 20 "$HOME/.ssh/id_rsa" 2>&1 | tail -1
-GPG 密钥环|ls "$HOME/.gnupg" 2>&1 | head -1
+geo.json 系统时区|jq -r .system_tz GEO_FILE_PATH 2>&1 | tail -1
+Claude machineID|jq -r .machineID $HOME/.claude.json 2>&1 | cut -c1-12
+Claude 历史目录|ls $HOME/.claude/projects 2>/dev/null | wc -l
+SSH 私钥|head -c 20 $HOME/.ssh/id_rsa 2>&1 | tail -1
+GPG 密钥环|ls $HOME/.gnupg 2>&1 | head -1
+Keychain 条目|security find-generic-password -s gh:github.com 2>&1 | head -1
 node 时区(未注入)|env -u TZ node -e "console.log(Intl.DateTimeFormat().resolvedOptions().timeZone)" 2>&1 | tail -1
 node 时区(已注入)|node -e "console.log(Intl.DateTimeFormat().resolvedOptions().timeZone)" 2>&1 | tail -1
 python 时区名(未注入)|env -u TZ python3 -I -c "import time;print(time.tzname)" 2>&1 | tail -1
 CHECKS
+)
+  while IFS='|' read -r label cmd; do
+    [ -n "$label" ] || continue
+    base=$(env -i HOME="$HOME" PATH="$PATH" TZ="$tz" sandbox-exec -f "$base_prof" /bin/sh -c "$cmd" 2>&1 | head -1 | tr '\t' ' ')
+    gate=$(env -i HOME="$HOME" PATH="$PATH" TZ="$tz" sandbox-exec -f "$VERIFY_PROF" /bin/sh -c "$cmd" 2>&1 | head -1 | tr '\t' ' ')
+    printf '%-24s %-22s %s\n' "$label" "$(cut -c1-22 <<<"${base:-—}")" "$(cut -c1-34 <<<"${gate:-—}")"
+  done <<<"$cmds"
   rm -f "$base_prof"
   echo
+  echo "TZ 取值来源：$tz_source"
   echo "闸门内 TZ 应等于 IP 时区（$tz）；文件型通道应为空 / 拒绝。"
-  echo "序列号 / 机型名 / MAC / 电脑名（scutil 走 XPC）是已知残余通道：它们走 iokit 与 sysctl，"
+  echo "机型 hw.model 两列都是 EPERM，不是闸门的功劳：hw.model 不在官方 sysctl 白名单里，"
+  echo "官方沙箱本来就拒绝（sysctl -n 在骨架里连允许的名字都报 fmt 错误，所以这里用 sysctlbyname）。"
+  echo "序列号 / 机型名 / MAC / hostname 是已知残余通道：它们走 iokit 与 sysctl，"
   echo "settings.json 没有注入这两类规则的入口（权限规则里的 Bash(...) 只在对话内挡一层）。"
+  echo "scutil --get ComputerName 返回的是机型名（IOKit），不是个人名：真正来源 configd 不在 mach 白名单里。"
   echo "闸门内若不注入 TZ，date 与 node 会一起退化成 UTC——这是本机时区已被藏起来的证据；"
   echo "两者必须一致退化：node 仍报 America/Los_Angeles 而 date 报 UTC，说明有通道没关。"
 }
@@ -501,10 +627,65 @@ status() {
 }
 
 revert() {
-  [ -f "$BACKUP" ] || die "没有备份 $BACKUP"
-  local tmp="$SETTINGS.identity.$$"
-  cp -p "$BACKUP" "$tmp" && mv -f "$tmp" "$SETTINGS" || die "恢复失败"
-  say "已从 $BACKUP 恢复（重启 Claude Code 生效）"
+  local target; target=$(resolve_symlinks "$SETTINGS") || die "无法解析 $SETTINGS 的符号链接"
+  local tmp="$target.identity.$$"
+  if [ -f "$BACKUP" ]; then
+    cp -p "$BACKUP" "$tmp" || die "恢复失败（无法复制备份）"
+    [ -s "$tmp" ] && jq -e . "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "备份 $BACKUP 不是合法 JSON，拒绝覆盖"; }
+    mv -f "$tmp" "$target" || { rm -f "$tmp"; die "恢复失败"; }
+    say "已从 $BACKUP 恢复（重启 Claude Code 生效）"
+    return 0
+  fi
+  # 备份是用户可以随手删掉的 dotfile。没有它时不能只会说「没有备份」就退出：
+  # 那样闸门就成了关不掉的开关，而 uninstall.sh 还承诺 identity.sh 能关掉它。
+  # 这里改为**外科式撤销**——只减掉 apply 自己加进去的那几项（用同一套生成器
+  # 算出来，和 apply 写进去的必然一致），不碰用户原有的任何规则。
+  # 沙箱开关类键（enabled / failIfUnavailable / allowUnsandboxedCommands 等）
+  # 分不清是用户设的还是 apply 设的，一律保留：它们不泄露身份，且方向是更安全的一侧。
+  [ -f "$SETTINGS" ] || die "找不到 $SETTINGS，也没有备份 $BACKUP"
+  need jq
+  local deny_json read_json bash_json tz
+  deny_json=$(deny_paths      | jq -R . | jq -s 'map(select(length>0))')
+  read_json=$(read_deny_rules_all | jq -R . | jq -s 'map(select(length>0))')
+  bash_json=$(bash_deny_rules | jq -R . | jq -s 'map(select(length>0))')
+  tz=$(ip_tz 2>/dev/null || true)
+
+  if ! jq --argjson deny "$deny_json" --argjson rd "$read_json" \
+          --argjson bd "$bash_json" --arg tz "$tz" '
+      .sandbox.filesystem.denyRead =
+        ((.sandbox.filesystem.denyRead // []) - $deny)
+      | .sandbox.network.allowMachLookup =
+        ((.sandbox.network.allowMachLookup // []) - ["com.apple.trustd.agent"])
+      | .permissions.deny =
+        ((.permissions.deny // []) - $rd - $bd)
+      # 只在能证明「这个 TZ 就是闸门写进去的那一个」时才删：拿不到 geo.json
+      # 就无法证明，删掉可能正好删了用户自己设的值，那宁可留下并提示。
+      | (if $tz != "" and .env.TZ == $tz then del(.env.TZ) else . end)
+      | (if .env.LANG  == "en_US.UTF-8" then del(.env.LANG)  else . end)
+      | (if .env.LC_ALL == "en_US.UTF-8" then del(.env.LC_ALL) else . end)
+      | (if (.sandbox.filesystem.denyRead | length) == 0 then del(.sandbox.filesystem.denyRead) else . end)
+      | (if (.sandbox.network.allowMachLookup | length) == 0 then del(.sandbox.network.allowMachLookup) else . end)
+      | (if (.permissions.deny | length) == 0 then del(.permissions.deny) else . end)
+      | (if (.sandbox.network | length) == 0 then del(.sandbox.network) else . end)
+      | (if (.sandbox.filesystem | length) == 0 then del(.sandbox.filesystem) else . end)
+      | (if (.sandbox | length) == 0 then del(.sandbox) else . end)
+      | (if (.permissions // {} | length) == 0 then del(.permissions) else . end)
+      | (if (.env | length) == 0 then del(.env) else . end)
+    ' "$target" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    die "没有备份，且外科式撤销失败；请手工编辑 $SETTINGS"
+  fi
+  if [ ! -s "$tmp" ] || ! jq -e . "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"; die "外科式撤销输出非法 JSON；未改动任何文件"
+  fi
+  mv -f "$tmp" "$target" || { rm -f "$tmp"; die "恢复失败"; }
+  say "没有备份；已用外科式撤销移除闸门加入的 denyRead / Read() / Bash() / env 条目"
+  say "（沙箱开关类键保留：分不清是否由本脚本设置，且它们不泄露身份）"
+  if [ -z "$tz" ]; then
+    # geo.json 也没了就无法证明 .env.TZ 是闸门写的；留着并说明，而不是静默留一条。
+    say "⚠️  读不到 geo.json，无法判断 .env.TZ 是否由闸门写入，已保留：$(jq -r '.env.TZ // "未设置"' "$target")"
+  fi
+  say "重启 Claude Code 生效"
 }
 
 case "$MODE" in

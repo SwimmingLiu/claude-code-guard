@@ -2316,31 +2316,45 @@ final class DashboardViewController: NSViewController {
     @objc func enforceToggled() {
         guard !suppressSwitch else { return }
         let now = Date().timeIntervalSince1970
-        // Turning enforcement off takes two clicks within 4 s. A modal alert
-        // would have to activate the app (and steal focus); this keeps the
-        // panel nonactivating.
-        if enforceSwitch.state == .off {
-            if now < pendingDisableUntil {
-                pendingDisableUntil = 0
-                finishEnforceChange(ok: delegate?.setEnforce(false) ?? false)
-                return
-            }
-            // Leave the switch visually off while waiting for the second
-            // click, and keep the instruction next to the switch instead of
-            // replacing the report subtitle at the top of the panel.
-            let deadline = now + 4
-            pendingDisableUntil = deadline
-            render(report: delegate?.report, age: delegate?.reportAge ?? 9999, live: false)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4.05) { [weak self] in
-                guard let self = self, self.pendingDisableUntil == deadline else { return }
-                self.pendingDisableUntil = 0
-                self.render(report: self.delegate?.report,
-                            age: self.delegate?.reportAge ?? 9999, live: false)
-            }
+
+        // Never trust `enforceSwitch.state` to tell us what the user meant:
+        // NSSwitch flips its own state *before* sending the action, and while a
+        // disable is pending both render paths force the control OFF. So the
+        // confirming click arrives with `state == .on` — reading the control
+        // would restart the guard with ENFORCE=1 instead of stopping it.
+        // Intent comes from the pending deadline, not from the control.
+        if now < pendingDisableUntil {
+            // Second click inside the window: this is the confirmation.
+            pendingDisableUntil = 0
+            finishEnforceChange(ok: delegate?.setEnforce(false) ?? false)
             return
         }
-        pendingDisableUntil = 0
-        finishEnforceChange(ok: delegate?.setEnforce(true) ?? false)
+
+        // Moving to "仅观察" takes two clicks within 4 s. A modal alert would
+        // have to activate the app (and steal focus); this keeps the panel
+        // nonactivating. Turning it back on is immediate, so it can always be
+        // undone with one click.
+        //
+        // The switch is currently reporting ON exactly when enforcement is
+        // configured on; if it reads OFF, the user is asking to enable.
+        let enforcing = delegate?.configuredEnforce() ?? false
+        if !enforcing {
+            finishEnforceChange(ok: delegate?.setEnforce(true) ?? false)
+            return
+        }
+
+        // Arm the pending disable. The control stays visually OFF (so the user
+        // sees the switch has moved) and the caption next to it carries the
+        // "click again" instruction.
+        let deadline = now + 4
+        pendingDisableUntil = deadline
+        render(report: delegate?.report, age: delegate?.reportAge ?? 9999, live: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.05) { [weak self] in
+            guard let self = self, self.pendingDisableUntil == deadline else { return }
+            self.pendingDisableUntil = 0
+            self.render(report: self.delegate?.report,
+                        age: self.delegate?.reportAge ?? 9999, live: false)
+        }
     }
 
     private func finishEnforceChange(ok: Bool) {
