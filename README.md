@@ -101,7 +101,7 @@ macOS 自带 `bash`、`curl`、`nc`、`lsof`、`route`、`netstat`、`sysctl`。
 | `guard.sh` | 守卫本体；不带参数等于 `--check`；支持 `--check` / `--status` / `--once` / `--loop` / `--simulate=unhealthy\|direct\|bypass`；未知参数或未知模拟模式以退出码 2 拒绝。`--json` 让 `--check`/`--status` 输出 JSON，`--state-dir` 打印实际状态目录 |
 | `geo.sh` | 出口 IP 身份：查 `ipinfo.io`，校验后写 `geo.json`，注入 `TZ`、关闭 Claude Code 遥测开关；`--force` 立即刷新，`--print` 只读缓存，`--quiet` 供守卫调用 |
 | `identity.sh` | 身份闸门：`apply` 写 `~/.claude/settings.json`（沙箱 + 权限规则，先备份）、`verify` 跑 seatbelt 对照实验、`status`、`revert` |
-| `docs/identity-gate.md` | 身份闸门的设计与实测记录：三列通道矩阵、四条被推翻的说法、残余通道 |
+| `docs/identity-gate.md` | 身份闸门的设计与实测记录：三列通道矩阵、八条被推翻的说法、残余通道 |
 | `config.env.example` | 配置模板，安装时复制为 `config.env` |
 | `com.swimmingliu.proxyguard.plist` | launchd 模板，每 10 秒跑一次 `--once` |
 | `install.sh` | 安装到 `~/Library/Application Support/proxyguard/` 并加载 LaunchAgent；先校验、后替换，加载失败会回滚上一份 `guard.sh`/`geo.sh`/`identity.sh` |
@@ -273,13 +273,17 @@ launchctl print "gui/$(id -u)/com.swimmingliu.proxyguard" | sed -n '1,25p'
 
 **关键设计（每条都来自本机实测，改了会静默失效）：**
 
-- 时区封 `/private/etc/localtime` 这个链接，**不封 zoneinfo 大洲**。zoneinfo 是静态世界库，读某个条目不能反推本机时区；封大洲只会让 `TZ=Asia/Shanghai` 静默变 UTC、`ZoneInfo()` 报错，纯属工具损坏。
+- 时区封 `/private/etc/localtime` 这个链接，**不封 zoneinfo 大洲**。zoneinfo 是静态世界库，读某个条目不能反推本机时区；封大洲只会让 `TZ=Asia/Shanghai` 静默变 UTC、`ZoneInfo()` 报错，纯属工具损坏。`/var/db/timezone` 里没有 `localtime` 条目，不需要额外封。
 - 闸门内若不注入 `TZ`，`date`/`Intl` 全部退化为 **UTC**——这是「本机时区被藏起来」的必然结果，也是可被观察到的矛盾。所以 `apply` 会从 `geo.json` 读时区写进 `env.TZ`，读不到就拒绝启用；当前出口 `America/Los_Angeles`，闸门内稳定输出 `PST -0800`。
 - locale / 语言 / 键盘靠 **`denyRead` 整个 `~/Library/Preferences`**。它只在 Claude 的 `(deny default)` 骨架里生效（cfprefsd 不在 mach 白名单，`defaults` 只好直读文件）；单封 `.GlobalPreferences*.plist` 无效。`verify` 因此必须用真实骨架，用 `(allow default)` 会把这一行测成假阴性。
+- **`~/Library/Preferences` 不够**：只封它，`defaults domains` 还剩 140 条，全部来自 `~/Library/Containers`（715 个 App 容器、22 GB 的第三方数据）。两个都整目录封，域名清单归零。
+- **`(allow sysctl-write)` 必须带 `(sysctl-name …)` 限定**：裸写会连 `sysctl-read` 一起放开，`hw.model`、`kern.hostname`、`machdep.cpu.brand_string`、`kern.boottime` 全部可读。二进制 2.1.325 原文就是限定到 `kern.tcsm_enable` 一条。
+- Claude 自己的身份与历史也封：`~/.claude.json`（machineID）、`~/.claude/projects`（全部历史对话）、`~/.cache/proxyguard`（`geo.json` 的 `system_tz` 写着真实时区）、`~/.ssh/id_rsa`/`id_ed25519`、`~/.gnupg`、`~/.docker/config.json`。
 - `sandbox.network.httpProxyPort` **不构成网络隔离**——Claude Code 只在设了 `allowedDomains`/`denyAllNetwork` 时才生成 `(deny network*)`。真正锁死出口的是 Clash 的 TUN（见 §四）。
-- **打开沙箱本身有代价**：Keychain 用不了（`gh auth status` 报 token 无效，但 `~/Library/Keychains` 保留在 denyRead 里——数据库文件本来就该挡；要用 `GH_TOKEN`）、`open -a` 失败、Homebrew 的临时文件被拒。git over SSH、python/node 的 TLS 不受影响。
+- **打开沙箱本身有代价**（都是实测的）：Keychain 用不了（`gh auth status` 报 token 无效，但 `~/Library/Keychains` 保留在 denyRead 里——数据库文件本来就该挡；要用 `GH_TOKEN`）；**git over SSH 用不了**（私钥被封，`known_hosts` 没封所以主机校验正常）；`open -a` 失败；Homebrew 的临时文件被拒；**项目 hook 不再被沙箱包裹**（上游看到 `blockReadsOutsideWorkingDirectories` 或任何 `denyRead` 就判定 `person_read_rules` 并放弃包裹）。HTTPS + token 的正常开发流程不受影响。
+- **不要封 `~/.config/gh/hosts.yml`**：里面没有 token（token 在 keychain），只有已经由 `$HOME` 路径暴露的用户名，而封了 `gh` 连启动都失败。
 
-**残余通道**（详见 `docs/identity-gate.md` §4）：MAC 地址（`ifconfig`）、`hostname` / `kern.hostname`（封了会打死 `ps`/`python`/`npm`）、序列号与机型名（IOKit）、以及家目录路径本身携带的用户名。`dscl ... RealName` 已被沙箱挡住。
+**残余通道**（详见 `docs/identity-gate.md` §4）：MAC 地址（`ifconfig`）、`hostname` / `kern.hostname`（封了会打死 `ps`/`python`/`npm`）、序列号与机型名（IOKit）、`scutil --get ComputerName`（走 configd 的 XPC，不读文件），以及家目录路径本身携带的用户名。`dscl ... RealName` 已被沙箱挡住。
 
 `install.sh` 会把 `identity.sh` 一并安装到 `~/Library/Application Support/proxyguard/`，但**不会自动 apply**——修改 Claude Code 设置属于用户决定，安装脚本只把工具放到位并打印用法；`uninstall.sh --purge` 会先 `identity.sh revert` 再删除。
 
