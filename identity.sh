@@ -344,18 +344,30 @@ CHECKS
   echo "闸门内若不注入 TZ，date 会退化成 UTC——这是本机时区已被藏起来的证据。"
 }
 
+# 取值时不能用 `// "unset"`：jq 的 // 把 false 也当空值，会把「显式关掉」
+# 显示成「没设置」——而 allowUnsandboxedCommands=false 正是闸门的关键一项。
+settings_get() {
+  jq -r --arg p "$1" '
+    reduce ($p | split(".")[]) as $k (.;
+      if type == "object" and has($k) then .[$k] else null end)
+    | if . == null then "unset" else tostring end
+  ' "$SETTINGS" 2>/dev/null || echo unset
+}
+
 status() {
   [ -f "$SETTINGS" ] || die "找不到 $SETTINGS"
-  printf '%-26s %s\n' "沙箱" "$(jq -r '.sandbox.enabled // "unset"' "$SETTINGS")"
+  printf '%-26s %s\n' "沙箱" "$(settings_get sandbox.enabled)"
   printf '%-26s %s\n' "denyRead 条数" "$(jq -r '.sandbox.filesystem.denyRead // [] | length' "$SETTINGS")"
   printf '%-26s %s\n' "Read 工具 deny 条数" "$(jq -r '[.permissions.deny // [] | .[] | select(startswith("Read("))] | length' "$SETTINGS")"
   printf '%-26s %s\n' "Bash 行为规则条数" "$(jq -r '[.permissions.deny // [] | .[] | select(startswith("Bash("))] | length' "$SETTINGS")"
   printf '%-26s %s\n' "沙箱出口代理端口" "$(jq -r '.sandbox.network.httpProxyPort // "unset"' "$SETTINGS")"
-  printf '%-26s %s\n' "failIfUnavailable" "$(jq -r '.sandbox.failIfUnavailable // "unset"' "$SETTINGS")"
-  printf '%-26s %s\n' "allowUnsandboxedCommands" "$(jq -r '.sandbox.allowUnsandboxedCommands // "unset"' "$SETTINGS")"
-  printf '%-26s %s\n' "blockReadsOutsideCWD" "$(jq -r '.permissions.blockReadsOutsideWorkingDirectories // "unset"' "$SETTINGS")"
+  printf '%-26s %s\n' "failIfUnavailable" "$(settings_get sandbox.failIfUnavailable)"
+  printf '%-26s %s\n' "allowUnsandboxedCommands" "$(settings_get sandbox.allowUnsandboxedCommands)"
+  printf '%-26s %s\n' "blockReadsOutsideCWD" "$(settings_get permissions.blockReadsOutsideWorkingDirectories)"
   printf '%-26s %s\n' "env.TZ" "$(jq -r '.env.TZ // "unset"' "$SETTINGS")"
   printf '%-26s %s\n' "env.LANG" "$(jq -r '.env.LANG // "unset"' "$SETTINGS")"
+  printf '%-26s %s\n' "trustd.agent (allowMachLookup)" \
+    "$(jq -r 'if ((.sandbox.network.allowMachLookup // []) | index("com.apple.trustd.agent")) then "已加入" else "未加入" end' "$SETTINGS")"
   printf '%-26s %s\n' "出口 IP 时区(geo.json)" "$(ip_tz || echo '读不到')"
   command -v claude >/dev/null 2>&1 && \
     printf '%-26s %s\n' "claude sandbox status" "$(claude sandbox status 2>/dev/null | jq -c '{supported,enabled,strictMode}' 2>/dev/null || echo 不可用)"
