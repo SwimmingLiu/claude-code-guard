@@ -22,6 +22,15 @@
 #   3. iokit / sysctl / mach-lookup 规则**无法**从 settings.json 注入——
 #      sandbox.filesystem.denyRead 只能表达文件路径。序列号、机型名、MAC、
 #      hostname 因此保持可读，属于已知残余通道（见文档 §4）。
+#      但「本机用哪个时区 / 哪套语言」这一类**文件型**证据是能封干净的：
+#      /Library/Preferences 整目录、~/.cache/proxyguard（geo.json 的
+#      system_tz 直接写着真实时区）、~/.claude.json 与 ~/.claude/projects
+#      （Claude 自己的 machineID 与全部历史对话）、~/.ssh 私钥、~/.gnupg。
+#      封 ~/.ssh/id_* 的代价是沙箱内 git-over-SSH 失效（HTTPS+token 不受影响）。
+#      ~/Library/Containers 也要整目录封：`defaults domains` 剩下的 140 个
+#      偏好域名**全部**来自这里（实测逐个排除：封 Group Containers / Application
+#      Support 都不动，只有封 Containers 才归零），而且里面就是 DingTalk、
+#      WeWork 这类第三方 App 的全部本地数据。
 #   4. 时区数据库（zoneinfo）是静态世界库，读某个条目并不能反推本机时区；
 #      封大洲只会让 TZ=Asia/Shanghai 静默变 UTC、python zoneinfo 报错，
 #      所以不封。真正要封的是 /etc/localtime 这个指向本机时区的链接。
@@ -60,24 +69,27 @@ ip_tz() {
 # denyRead 清单：seatbelt 判定的真实路径。
 # 这里只放「文件型」通道——iokit / sysctl / XPC 无法用 denyRead 表达，
 # 也就无法从 settings.json 注入。
+#
+# /Library/Preferences 用**整目录**而不是逐个 plist：实测单独封
+# .GlobalPreferences.plist 只挡住 plutil，`defaults read` 照旧从 cfprefsd 拿到
+# CN；而 SystemConfiguration/preferences.plist（ComputerName）、
+# com.apple.bluetooth.plist（配对耳机 MAC + 名字）、com.apple.timezone.auto.plist
+# 也都在这个目录里，逐个列举必然漏。整目录一条覆盖全部。
+#
+# ~/Library/Containers 同理整目录：`defaults domains` 在只封了 Preferences 之后
+# 仍有 140 条，来源就是这里（实测封 Group Containers / Application Support /
+# Saved Application State 都不减少，只有封 Containers 才归零）。
 deny_paths() {
   cat <<'EOF'
 /private/etc/localtime
-/Library/Preferences/.GlobalPreferences.plist
-/Library/Preferences/com.apple.keyboardtype.plist
-/Library/Preferences/com.apple.HIToolbox.plist
-/Library/Preferences/com.apple.Keyboard-Settings.extension.plist
-/Library/Preferences/com.apple.keyboard.preferences.plist
-/Library/Preferences/com.apple.keyboardservicesd.plist
-/Library/Preferences/com.apple.menuextra.clock.plist
+/Library/Preferences
 /private/var/db/locationd
 /private/var/log/wifi.log
 /private/var/db/.AppleSetupDone
 EOF
   cat <<EOF
 $HOME/Library/Preferences
-$HOME/Library/Containers/com.apple.weather
-$HOME/Library/Containers/com.apple.Maps
+$HOME/Library/Containers
 $HOME/Library/Caches/com.apple.locationd
 $HOME/Library/Caches/com.apple.geod
 $HOME/Library/Application Support/AddressBook
@@ -91,6 +103,19 @@ $HOME/Library/Keychains
 $HOME/Library/IdentityServices
 $HOME/.CFUserTextEncoding
 $HOME/.netrc
+$HOME/.cache/proxyguard
+$HOME/.gnupg
+$HOME/.ssh/id_rsa
+$HOME/.ssh/id_ed25519
+$HOME/.docker/config.json
+$HOME/.claude.json
+$HOME/.claude/projects
+$HOME/.claude/sessions
+$HOME/.claude/history.jsonl
+$HOME/.claude/debug
+$HOME/.claude/keysmith
+$HOME/.claude/daemon
+$HOME/.claude/file-history
 EOF
 }
 
@@ -104,17 +129,11 @@ Read(//private/var/db/timezone/**)
 Read(//private/var/db/locationd/**)
 Read(//private/var/log/wifi.log)
 Read(//private/var/db/.AppleSetupDone)
-Read(//Library/Preferences/.GlobalPreferences.plist)
-Read(//Library/Preferences/com.apple.keyboardtype.plist)
-Read(//Library/Preferences/com.apple.HIToolbox.plist)
-Read(//Library/Preferences/com.apple.keyboard.preferences.plist)
-Read(//Library/Preferences/com.apple.keyboardservicesd.plist)
-Read(//Library/Preferences/com.apple.menuextra.clock.plist)
+Read(//Library/Preferences/**)
 EOF
   cat <<EOF
 Read(~/Library/Preferences/**)
-Read(~/Library/Containers/com.apple.weather/**)
-Read(~/Library/Containers/com.apple.Maps/**)
+Read(~/Library/Containers/**)
 Read(~/Library/Caches/com.apple.locationd/**)
 Read(~/Library/Caches/com.apple.geod/**)
 Read(~/Library/Application Support/AddressBook/**)
@@ -128,6 +147,19 @@ Read(~/Library/Keychains/**)
 Read(~/Library/IdentityServices/**)
 Read(~/.CFUserTextEncoding)
 Read(~/.netrc)
+Read(~/.cache/proxyguard/**)
+Read(~/.gnupg/**)
+Read(~/.ssh/id_rsa)
+Read(~/.ssh/id_ed25519)
+Read(~/.docker/config.json)
+Read(~/.claude.json)
+Read(~/.claude/projects/**)
+Read(~/.claude/sessions/**)
+Read(~/.claude/history.jsonl)
+Read(~/.claude/debug/**)
+Read(~/.claude/keysmith/**)
+Read(~/.claude/daemon/**)
+Read(~/.claude/file-history/**)
 EOF
 }
 
@@ -148,13 +180,27 @@ Bash(ifconfig:*)
 EOF
 }
 
-# denyRead 生成的那一段：与 Claude Code 的 Dj() 一样，先 (allow file-read*)，
-# 再逐条 deny。这是 apply 能表达的全部规则——别再往里加 iokit/sysctl，
-# 那些规则 Claude Code 不会从 settings.json 读，加了只会让 verify 说谎。
+# denyRead 生成的那一段。剖面里 (deny file-read*) 由 Dj() 发出，顺序是：
+#   (allow file-read*)                      ← 先全开
+#   (deny file-read* …)  ← 你写的 denyRead   ← 再逐条关
+#   (allow file-read* …) ← allowWithinDeny   ← 最后按 filesystem.allowRead 重开
+# seatbelt 是「后 match 者胜」，所以结尾那组 allow 会不会把闸门重新打开，
+# 全看 allowWithinDeny 装了什么。2.1.325 的实测答案：
+#   · 普通 Bash 走 vY()→DPo({readConfig})，allowWithinDeny 只来自
+#     settings 的 filesystem.allowRead（ky("allow", …)）；我们不写 allowRead，
+#     于是它是空数组，Dj() 不发出任何 allow，**deny 胜**。
+#   · 只有 ftn()/mtn() 那条「项目 hook 沙箱」把硬编码的 epr（含 /etc/localtime、
+#     /var/db/timezone）塞进 allowRead，会重开 localtime。而它跟本闸门不共存：
+#     HQe() 里 Jfr() 一旦看到 blockReadsOutsideWorkingDirectories 或任何
+#     denyRead/Read deny，就返回 unavailable:"person_read_rules"，
+#     项目 hook 干脆**不加沙箱**——所以 epr 永远轮不到生效。
+# 也就是说：这里只该有路径 deny。别再往里加 iokit/sysctl 规则，Claude Code 不会
+# 从 settings.json 读它们，加了只会让 verify 说谎。
 seatbelt_rules() {
-  local p
+  local p n=0
   while IFS= read -r p; do
     [ -n "$p" ] || continue
+    n=$((n+1))
     # 目录必须用 subpath，否则只挡住这个目录本身、拦不住里面的文件
     if [ -d "$p" ]; then
       printf '(deny file-read* (subpath "%s"))\n' "$p"
@@ -162,6 +208,11 @@ seatbelt_rules() {
       printf '(deny file-read* (literal "%s"))\n' "$p"
     fi
   done < <(deny_paths)
+  # 与 Dj() 一致：denyRead 非空时，**在 deny 之后**再放开「目录自身元数据」。
+  # 这是 Claude 官方沙箱本来就有的行为，不是闸门的漏洞——它让 ls/stat 目录能过，
+  # 但里面的文件仍被 deny 挡住。verify 必须原样复现，否则测的不是生产。
+  [ "$n" -gt 0 ] && printf '(allow file-read-metadata (vnode-type DIRECTORY))\n'
+  return 0
 }
 
 # verify 用的骨架：按 Claude Code 2.1.325 的 Lj() 重建（deny default + 白名单）。
@@ -201,21 +252,62 @@ claude_profile() {
   (iokit-user-client-class "IOSurfaceSendRight"))
 (allow iokit-get-properties)
 (allow system-socket (require-all (socket-domain AF_SYSTEM) (socket-protocol 2)))
+;; sysctl 白名单必须与二进制里的 49 项**逐字一致**。少一项的代价不是「读不到」，
+;; 而是 Go/LLVM 直接崩：实测漏掉 hw.cacheconfig / hw.pagesize_compat 等 21 项后，
+;; gh 报 "failed to get system page size"、node/npm 报 LowLevelAlloc arithmetic
+;; overflow、docker 同样崩。这一列是 2.1.325 里 Lj() 的原文顺序。
 (allow sysctl-read
-  (sysctl-name "hw.activecpu") (sysctl-name "hw.byteorder")
-  (sysctl-name "hw.cachelinesize_compat") (sysctl-name "hw.cpufamily")
-  (sysctl-name "hw.cputype") (sysctl-name "hw.logicalcpu")
-  (sysctl-name "hw.logicalcpu_max") (sysctl-name "hw.machine")
-  (sysctl-name "hw.memsize") (sysctl-name "hw.ncpu") (sysctl-name "hw.packages")
-  (sysctl-name "hw.pagesize") (sysctl-name "hw.physicalcpu")
-  (sysctl-name "hw.physicalcpu_max") (sysctl-name "hw.vectorunit")
-  (sysctl-name "kern.argmax") (sysctl-name "kern.hostname")
-  (sysctl-name "kern.maxfiles") (sysctl-name "kern.maxfilesperproc")
-  (sysctl-name "kern.maxproc") (sysctl-name "kern.ngroups")
-  (sysctl-name "kern.osproductversion") (sysctl-name "kern.osrelease")
-  (sysctl-name "kern.ostype") (sysctl-name "kern.osversion") (sysctl-name "kern.version")
-  (sysctl-name "machdep.cpu.brand_string") (sysctl-name "vm.loadavg")
+  (sysctl-name "hw.activecpu")
+  (sysctl-name "hw.busfrequency_compat")
+  (sysctl-name "hw.byteorder")
+  (sysctl-name "hw.cacheconfig")
+  (sysctl-name "hw.cachelinesize_compat")
+  (sysctl-name "hw.cpufamily")
+  (sysctl-name "hw.cpufrequency")
+  (sysctl-name "hw.cpufrequency_compat")
+  (sysctl-name "hw.cputype")
+  (sysctl-name "hw.l1dcachesize_compat")
+  (sysctl-name "hw.l1icachesize_compat")
+  (sysctl-name "hw.l2cachesize_compat")
+  (sysctl-name "hw.l3cachesize_compat")
+  (sysctl-name "hw.logicalcpu")
+  (sysctl-name "hw.logicalcpu_max")
+  (sysctl-name "hw.machine")
+  (sysctl-name "hw.memsize")
+  (sysctl-name "hw.ncpu")
+  (sysctl-name "hw.nperflevels")
+  (sysctl-name "hw.packages")
+  (sysctl-name "hw.pagesize_compat")
+  (sysctl-name "hw.pagesize")
+  (sysctl-name "hw.physicalcpu")
+  (sysctl-name "hw.physicalcpu_max")
+  (sysctl-name "hw.tbfrequency_compat")
+  (sysctl-name "hw.vectorunit")
+  (sysctl-name "kern.argmax")
+  (sysctl-name "kern.bootargs")
+  (sysctl-name "kern.hostname")
+  (sysctl-name "kern.maxfiles")
+  (sysctl-name "kern.maxfilesperproc")
+  (sysctl-name "kern.maxproc")
+  (sysctl-name "kern.ngroups")
+  (sysctl-name "kern.osproductversion")
+  (sysctl-name "kern.osrelease")
+  (sysctl-name "kern.ostype")
+  (sysctl-name "kern.osvariant_status")
+  (sysctl-name "kern.osversion")
+  (sysctl-name "kern.secure_kernel")
+  (sysctl-name "kern.tcsm_available")
+  (sysctl-name "kern.tcsm_enable")
+  (sysctl-name "kern.usrstack64")
+  (sysctl-name "kern.version")
+  (sysctl-name "kern.willshutdown")
+  (sysctl-name "machdep.cpu.brand_string")
+  (sysctl-name "machdep.ptrauth_enabled")
+  (sysctl-name "security.mac.lockdown_mode_state")
+  (sysctl-name "sysctl.proc_cputype")
+  (sysctl-name "vm.loadavg")
   (sysctl-name-prefix "hw.optional.arm")
+  (sysctl-name-prefix "hw.optional.arm.")
   (sysctl-name-prefix "hw.optional.armv8_")
   (sysctl-name-prefix "hw.perflevel")
   (sysctl-name-prefix "kern.proc.all")
@@ -224,15 +316,32 @@ claude_profile() {
   (sysctl-name-prefix "machdep.cpu.")
   (sysctl-name-prefix "net.routetable.")
   (sysctl-name-prefix "kern.procargs"))
+;; V8 thread calculations 要写 sysctl。**必须带 (sysctl-name …) 限定**：
+;; 裸写 (allow sysctl-write) 会把 sysctl-read 一起放开（seatbelt 里 write 蕴含
+;; read），于是 hw.model / kern.hostname / machdep.cpu.brand_string / kern.boottime
+;; 全部可读——这正是早先 verify 误报「hw.model 两列都是 Mac16,12」的原因。
+;; 二进制 2.1.325 的原文就是限定到 kern.tcsm_enable 一条。
+(allow sysctl-write
+  (sysctl-name "kern.tcsm_enable"))
 (allow distributed-notification-post)
-(allow file-ioctl file-read-data file-write-data (require-all (literal "/dev/null") (vnode-type CHARACTER-DEVICE)))
-(allow file-ioctl (literal "/dev/zero") (literal "/dev/random") (literal "/dev/urandom") (literal "/dev/tty"))
+;; keychain 相关服务。securityd.xpc 在上面那条 mach 白名单里，SecurityServer 是另一条。
+(allow mach-lookup (global-name "com.apple.SecurityServer"))
+;; File I/O on device files
+(allow file-ioctl (literal "/dev/null"))
+(allow file-ioctl (literal "/dev/zero"))
+(allow file-ioctl (literal "/dev/random"))
+(allow file-ioctl (literal "/dev/urandom"))
+(allow file-ioctl (literal "/dev/dtracehelper"))
+(allow file-ioctl (literal "/dev/tty"))
 (allow pseudo-tty)
 (allow file-read* file-write* (literal "/dev/ptmx") (regex #"^/dev/ttys"))
 ;; trustd.agent：apply 会把它写进 sandbox.network.allowMachLookup
 (allow mach-lookup (global-name "com.apple.trustd.agent"))
 (allow file-read*)
-(allow file-read-metadata (vnode-type DIRECTORY))
+;; 注意：Dj() 只在 denyRead 非空时才追加
+;;   (allow file-read-metadata (vnode-type DIRECTORY))
+;; 而且它排在所有 deny **之后**（后 match 者胜）。所以这一行不能放在这里，
+;; 否则 verify 会把「被拒目录的 stat」测成比生产更严——见 seatbelt_rules()。
 (allow file-write* (subpath "/private/tmp") (subpath "/private/var/folders") (literal "/dev/null"))
 (allow network*)
 (allow system-socket (socket-domain AF_UNIX))
@@ -327,7 +436,11 @@ TZ 显示|date "+%Z %z"
 读 localtime|cat /etc/localtime >/dev/null 2>&1 && echo 可读 || echo 拒绝
 AppleLocale|defaults read -g AppleLocale 2>&1 | tail -1
 系统语言|defaults read -g AppleLanguages 2>&1 | tail -1
+系统 Country|defaults read /Library/Preferences/.GlobalPreferences Country 2>&1 | tail -1
 键盘/输入法|defaults read com.apple.HIToolbox 2>&1 | tail -1
+电脑名(偏好文件)|plutil -extract System.System.ComputerName raw /Library/Preferences/SystemConfiguration/preferences.plist 2>&1 | tail -1
+配对蓝牙名|plutil -p /Library/Preferences/com.apple.bluetooth.plist 2>&1 | grep -c BSDName
+时区自动设置|plutil -extract Active raw /Library/Preferences/com.apple.timezone.auto.plist 2>&1 | tail -1
 定位客户端库|plutil -p /var/db/locationd/clients.plist >/dev/null 2>&1 && echo 可读 || echo 拒绝
 Wi-Fi 日志|cat /var/log/wifi.log >/dev/null 2>&1 && echo 可读 || echo 拒绝
 Wi-Fi 优选网络|networksetup -listpreferredwirelessnetworks en0 2>&1 | sed -n 2p
@@ -335,13 +448,23 @@ Wi-Fi 优选网络|networksetup -listpreferredwirelessnetworks en0 2>&1 | sed -n
 序列号 ioreg|ioreg -l 2>/dev/null | grep -c IOPlatformSerialNumber
 MAC 地址数|ifconfig 2>/dev/null | grep -c ether
 电脑名|scutil --get ComputerName 2>&1
+home 偏好域名数|defaults domains 2>/dev/null | tr ',' '\n' | grep -c '[^[:space:]]'
+geo.json 系统时区|jq -r .system_tz "$HOME/.cache/proxyguard/geo.json" 2>&1 | tail -1
+Claude machineID|jq -r .machineID "$HOME/.claude.json" 2>&1 | cut -c1-12
+Claude 历史目录|ls "$HOME/.claude/projects" 2>&1 | wc -l
+SSH 私钥|head -c 20 "$HOME/.ssh/id_rsa" 2>&1 | tail -1
+GPG 密钥环|ls "$HOME/.gnupg" 2>&1 | head -1
+node 时区(未注入)|env -u TZ node -e "console.log(Intl.DateTimeFormat().resolvedOptions().timeZone)" 2>&1 | tail -1
+node 时区(已注入)|node -e "console.log(Intl.DateTimeFormat().resolvedOptions().timeZone)" 2>&1 | tail -1
+python 时区名(未注入)|env -u TZ python3 -I -c "import time;print(time.tzname)" 2>&1 | tail -1
 CHECKS
   rm -f "$base_prof"
   echo
   echo "闸门内 TZ 应等于 IP 时区（$tz）；文件型通道应为空 / 拒绝。"
-  echo "序列号 / 机型名 / MAC / 电脑名 是已知残余通道：它们走 iokit 与 sysctl，"
+  echo "序列号 / 机型名 / MAC / 电脑名（scutil 走 XPC）是已知残余通道：它们走 iokit 与 sysctl，"
   echo "settings.json 没有注入这两类规则的入口（权限规则里的 Bash(...) 只在对话内挡一层）。"
-  echo "闸门内若不注入 TZ，date 会退化成 UTC——这是本机时区已被藏起来的证据。"
+  echo "闸门内若不注入 TZ，date 与 node 会一起退化成 UTC——这是本机时区已被藏起来的证据；"
+  echo "两者必须一致退化：node 仍报 America/Los_Angeles 而 date 报 UTC，说明有通道没关。"
 }
 
 # 取值时不能用 `// "unset"`：jq 的 // 把 false 也当空值，会把「显式关掉」
