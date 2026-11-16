@@ -100,9 +100,11 @@ macOS 自带 `bash`、`curl`、`nc`、`lsof`、`route`、`netstat`、`sysctl`。
 | --- | --- |
 | `guard.sh` | 守卫本体；不带参数等于 `--check`；支持 `--check` / `--status` / `--once` / `--loop` / `--simulate=unhealthy\|direct\|bypass`；未知参数或未知模拟模式以退出码 2 拒绝。`--json` 让 `--check`/`--status` 输出 JSON，`--state-dir` 打印实际状态目录 |
 | `geo.sh` | 出口 IP 身份：查 `ipinfo.io`，校验后写 `geo.json`，注入 `TZ`、关闭 Claude Code 遥测开关；`--force` 立即刷新，`--print` 只读缓存，`--quiet` 供守卫调用 |
+| `identity.sh` | 身份闸门：`apply` 写 `~/.claude/settings.json`（沙箱 + 权限规则，先备份）、`verify` 跑 seatbelt 对照实验、`status`、`revert` |
+| `docs/identity-gate.md` | 身份闸门的设计与实测记录：三列通道矩阵、四条被推翻的说法、残余通道 |
 | `config.env.example` | 配置模板，安装时复制为 `config.env` |
 | `com.swimmingliu.proxyguard.plist` | launchd 模板，每 10 秒跑一次 `--once` |
-| `install.sh` | 安装到 `~/Library/Application Support/proxyguard/` 并加载 LaunchAgent；先校验、后替换，加载失败会回滚上一份 `guard.sh` |
+| `install.sh` | 安装到 `~/Library/Application Support/proxyguard/` 并加载 LaunchAgent；先校验、后替换，加载失败会回滚上一份 `guard.sh`/`geo.sh`/`identity.sh` |
 | `uninstall.sh` | 卸载；`--purge` 同时删除配置、状态与日志 |
 | `app/main.swift` | 菜单栏可视化软件 ProxyGuard.app 的源码（Swift，Command Line Tools 即可编译） |
 | `build-app.sh` | 编译并 ad-hoc 签名到 `dist/ProxyGuard.app` |
@@ -116,7 +118,7 @@ macOS 自带 `bash`、`curl`、`nc`、`lsof`、`route`、`netstat`、`sysctl`。
 - 状态：`~/.cache/proxyguard/`（fail 计数、boot id、启动时间、锁；可在配置里用 `STATE_DIR` 改）
 - 状态报告：`~/.cache/proxyguard/last_report.json`（每个 `--once` tick 原子覆盖一份，菜单栏软件读它）
 - IP 身份：`~/.cache/proxyguard/geo.json`（每 `GEO_REFRESH` 秒刷新；时间、地区、坐标、运营商、时区注入状态）与 `geo_attempt`（上次尝试时间，失败时用于退避）
-- Claude Code 设置备份：`~/.claude/settings.json.proxyguard.bak`（首次写入 `TZ`/遥测开关前留一份）
+- Claude Code 设置备份：`~/.claude/settings.json.proxyguard.bak`（首次写入 `TZ`/遥测开关前留一份；`identity.sh revert` 也从这里恢复）
 - launchd 输出：`~/Library/Logs/proxyguard.launchd.log` / `.err.log`
 
 ## 六、安装
@@ -141,6 +143,8 @@ bash install.sh
 安装会先把 `guard.sh`、`geo.sh`、配置和 plist 复制成暂存文件并校验（`bash -n`、`plutil -lint`、装后配置 dry run），然后 `bootout` 旧 agent、重置已配置 `STATE_DIR` 里的状态、原子替换文件、`launchctl bootstrap`；如果加载失败，会把上一份 `guard.sh`、`geo.sh` 和 plist 一起放回并重试，仍失败则以非零退出码告诉你 agent 没有在运行。它不会因为当前状态不健康而拒绝安装。安装还会清空旧 fail 计数/宽限状态，使 30 秒宽限从安装时的首次 tick 重新计算。
 
 > 安装后如果代理正好不可用，先有 30 秒启动宽限；宽限期后连续两个 tick（约 20 秒）就会杀掉 magpie、Claude Desktop，以及正在运行本会话的 Claude Code；一旦发现直连旁路，宽限期内也会立即杀。确认这一点再执行。
+
+`install.sh` 也会把 `identity.sh` 装到同一目录，但**不会自动 apply**：修改 Claude Code 设置是用户的决定。装好后先跑 `./identity.sh verify` 看对照表，再决定是否 `apply`（见 §10.1）。
 
 ## 七、验证与测试
 
@@ -213,10 +217,12 @@ launchctl print "gui/$(id -u)/com.swimmingliu.proxyguard" | sed -n '1,25p'
 - **只有系统代理、没有 TUN 时，存在检测窗口。** 那个模式下守卫靠 `lsof` 每 10 秒审计一次：一个在两次审计之间建立又关闭的直连可能漏掉，所以“发现直连立即杀”仍不是防火墙级的阻断。要绝对阻止直连，应保持 Clash Verge 的 TUN 开启。
 - **Clash 当前 `allow-lan=true`，监听 `*:7897/7898/7899`。** 局域网内其他设备也能使用这个代理；守卫只约束本机的 Claude 进程，不改变 Clash 的监听范围。若不需要，关闭 allow-lan。
 - **Claude 派生的子进程不在杀名单。** Claude Desktop 会 spawn `curl`/`ssh` 等；当前 Antify 的 `spawnedProcessesInherit` 把它们转到 Clash 7897。若这条规则被关闭，守卫的 `lsof` 审计看不到它们，需要把它们加入目标匹配或依赖 TUN。
+- **进程范围是“按可执行文件匹配的平铺名单”，不是进程树。** `collect_targets` 只读 `ps -axo pid=,comm=`（`guard.sh:506`），按 `kind_of_comm`（`guard.sh:468`）判断命中，不读 ppid/pgid/sess，也不做 `pgrep -P` 递归：Claude 派生的 `zsh`/`bash`/`curl`/`python3` 既不在目标表里，也不会被 `audit_sockets` 逐个 `lsof`（`guard.sh:554`）。击杀同样是逐个 PID（`kill_list`，`guard.sh:835`），杀掉 Claude 主进程后子进程会留下并继续运行。能覆盖到它们的只有两条旁路：(1) TUN 在路由层接管全部出口；(2) Antify 的 `spawnedProcessesInherit` 把它们塞进 7897。两条都不在时，子进程的直连对守卫不可见。
+- **“个人信息”（地址/时间）由两层负责：`geo.sh` 注入，`identity.sh` 拦截。** 守卫本身不监听任何系统调用，`geo.sh` 只做注入（`launchctl setenv TZ`，`geo.sh:133`，以及 `~/.claude/settings.json` 的 `env`：`TZ` 与四个遥测开关），面板上的 IP/地区/坐标/时间是读 `geo.json` 的展示值。拦截是另一件事，由 `identity.sh` 写进 Claude Code 的沙箱与权限规则完成（见下一节）。两者都不需要时，闸门默认不启用。
 - **只审计 TCP 与已连接的 UDP。** `lsof -iTCP -iUDP` 能看到 TCP 和连向固定远端的 UDP；未连接的 UDP socket 没有远端地址，不在审计范围。Clash TUN 开启时 UDP 同样被接管；TUN 关闭时 QUIC 流可能绕过系统代理。
 - **规则直连只覆盖可归因的活跃连接。** 守卫检查 `processPath` 匹配 Claude/magpie/Antify、主机匹配 `CLAUDE_HOST_RE` 的活跃连接；若 mihomo 没有进程归因（`find-process-mode` 关闭或受限），匹配 Claude 主机但 `processPath` 为空的连接会被判为"未验证"并走失败阈值，而不是当作已代理。主机为空、只有 IP、或连接在两次检查之间建立并关闭时仍可能漏掉。需要绝对阻断时保持 TUN，或把 `CLAUDE_HOST_RE` 扩大到实际使用的模型域名。
 - **进程审计失败也算不健康。** `ps`/`lsof` 不可用或 `ps` 执行失败时，守卫不会把"没收集到目标"当成"没有 Claude 在跑"，而是直接判为不健康。
-- **出口组名是硬编码匹配。** `REQUIRED_CHAIN` 必须与 mihomo 里显示的组名完全一致（含 emoji）；在 Clash Verge 里重命名 `🛡️ 静态IP出口` 会让所有 Claude 连接判为 `no-required-exit` 并被杀，改名前先同步配置。
+- **出口组名是硬编码匹配。** `REQUIRED_CHAIN` 必须与 mihomo 里显示的组名完全一致（含 emoji）；在 Clash Verge 里重命名 `🛡️ 静态IP出口` 会让所有 Claude 连接判为 `no-required-exit` 并被杀，改名前先同步配置。面板的“出口组”一行会去掉名字里的 emoji 再显示，避免和行首的 ✓ 混淆。
 - **只承认 Clash 作为出口。** Antify 的上游也是 Clash 7897；如果你以后换成完全不同的代理（不再经过 Clash），守卫会判定无覆盖并杀 Claude。要支持它，需要把该代理的 TUN 设备/本地端口/规则链接入判断。
 - **Antify 的过滤器/kill switch 不在守卫的判断里。** 它可能阻断某些流，但守卫只判断“流量是否经 Clash 代理”；Antify 阻断不等于直连泄漏，反之亦然。
 - **睡眠唤醒 / Clash 重启**：唤醒后如果代理还没恢复，最多两个 tick（约 20 秒）后开始杀；`STARTUP_GRACE` 只覆盖开机后的第一次启动，不覆盖每次唤醒。
@@ -241,26 +247,58 @@ launchctl print "gui/$(id -u)/com.swimmingliu.proxyguard" | sed -n '1,25p'
 
 边界与行为：
 
-- **不改系统时区。** 面板会显示「系统时区：Asia/Shanghai（不改系统，仅注入应用）」。这样只影响 Claude 链的应用环境，不会改整台 Mac 的时钟；需要系统级一致时再手动 `sudo systemsetup -settimezone`。
+- **不改系统时区。** 面板会显示「系统时区：Asia/Shanghai（不修改系统）」。这样只影响 Claude 链的应用环境，不会改整台 Mac 的时钟；需要系统级一致时再手动 `sudo systemsetup -settimezone`。
 - **重启后生效。** `launchctl setenv` 和 `settings.json` 的 `TZ` 都作用于新启动的进程；已经在跑的 Claude Desktop / Claude Code 需要重启才会看到新时区。
 - **位置以 IP 为准，设备定位从不读取。** 设置了 `GEO_ADDRESS` 时，面板「地区」改为显示你提供的地址（标记为“用户地址”），时间仍跟随 IP；没有设置时显示 IP 的城市/州/国家。
 - **遥测开关只覆盖 Claude Code 的设置项。** Claude Desktop 自身的遥测不由这些变量控制；守卫能做的是保证它的流量只能走代理。
 - **geo 失败不影响健康判定，也不拖慢判定。** 查询在判定和报告写完之后以独立子进程运行，失败只写日志（`geo_attempt` 记录尝试时间，`GEO_REFRESH` 后再试）；`fail_count`、击杀逻辑完全不受影响，面板显示上一份缓存及其时间。
 
+### 10.1 身份闸门（identity.sh）
+
+`geo.sh` 负责“给什么”，`identity.sh` 负责“不让读什么”。网络层管不到本机读取：Claude Code 能直接读 `/etc/localtime`、`defaults read -g AppleLocale`、`/var/db/locationd`、`ioreg`，这些都必须在内核/权限层关掉，否则注入的 `TZ` 只是一层随时可被绕过的环境变量。
+
+```bash
+./identity.sh verify    # 只读对照实验：同一组规则，闸门外 vs 闸门内
+./identity.sh apply     # 写入 ~/.claude/settings.json（先备份为 .proxyguard.bak）
+./identity.sh status    # 当前闸门状态与残余通道
+./identity.sh revert    # 从备份恢复
+```
+
+闸门由两条互补的路径组成，缺一不可：
+
+- **Bash / PowerShell / Monitor** 走 Claude Code 官方沙箱。`apply` 打开 `sandbox.enabled`、`failIfUnavailable`、关闭 `allowUnsandboxedCommands`，并把文件型通道写进 `sandbox.filesystem.denyRead`；同时设置 `sandbox.network.httpProxyPort=7897`，让沙箱内的流量走 Clash，并把 `com.apple.trustd.agent` 加进 `sandbox.network.allowMachLookup`（否则 `gh`/`gcloud` 这类 Go CLI 全部校验证书失败）。
+- **Read / Grep / Glob 内置工具**绕过 Bash 沙箱（官方文档明说），所以同一份清单一式两份写成 `permissions.deny` 的 `Read(...)` 规则，并打开 `permissions.blockReadsOutsideWorkingDirectories`。
+
+**`settings.json` 能表达的只有文件路径和权限规则。** 序列号、机型名、MAC、主机名走的是 IOKit 与 sysctl，没有注入入口——它们是**已知残余通道**，`permissions.deny` 里的 `Bash(ioreg:*)`、`Bash(system_profiler:*)` 等只在对话内挡一层，脚本可绕过。
+
+**关键设计（每条都来自本机实测，改了会静默失效）：**
+
+- 时区封 `/private/etc/localtime` 这个链接，**不封 zoneinfo 大洲**。zoneinfo 是静态世界库，读某个条目不能反推本机时区；封大洲只会让 `TZ=Asia/Shanghai` 静默变 UTC、`ZoneInfo()` 报错，纯属工具损坏。
+- 闸门内若不注入 `TZ`，`date`/`Intl` 全部退化为 **UTC**——这是「本机时区被藏起来」的必然结果，也是可被观察到的矛盾。所以 `apply` 会从 `geo.json` 读时区写进 `env.TZ`，读不到就拒绝启用；当前出口 `America/Los_Angeles`，闸门内稳定输出 `PST -0800`。
+- locale / 语言 / 键盘靠 **`denyRead` 整个 `~/Library/Preferences`**。它只在 Claude 的 `(deny default)` 骨架里生效（cfprefsd 不在 mach 白名单，`defaults` 只好直读文件）；单封 `.GlobalPreferences*.plist` 无效。`verify` 因此必须用真实骨架，用 `(allow default)` 会把这一行测成假阴性。
+- `sandbox.network.httpProxyPort` **不构成网络隔离**——Claude Code 只在设了 `allowedDomains`/`denyAllNetwork` 时才生成 `(deny network*)`。真正锁死出口的是 Clash 的 TUN（见 §四）。
+- **打开沙箱本身有代价**：Keychain 用不了（`gh auth status` 报 token 无效，但 `~/Library/Keychains` 保留在 denyRead 里——数据库文件本来就该挡；要用 `GH_TOKEN`）、`open -a` 失败、Homebrew 的临时文件被拒。git over SSH、python/node 的 TLS 不受影响。
+
+**残余通道**（详见 `docs/identity-gate.md` §4）：MAC 地址（`ifconfig`）、`hostname` / `kern.hostname`（封了会打死 `ps`/`python`/`npm`）、序列号与机型名（IOKit）、以及家目录路径本身携带的用户名。`dscl ... RealName` 已被沙箱挡住。
+
+`install.sh` 会把 `identity.sh` 一并安装到 `~/Library/Application Support/proxyguard/`，但**不会自动 apply**——修改 Claude Code 设置属于用户决定，安装脚本只把工具放到位并打印用法；`uninstall.sh --purge` 会先 `identity.sh revert` 再删除。
+
 ## 十一、菜单栏软件（ProxyGuard.app）
 
-可视化层，不重复实现任何检查逻辑。菜单栏一个盾牌图标，颜色表示状态：绿色 = 代理正常，红色 = 未走代理，橙色 = 超过 90 秒没有新报告（守护可能没在跑），灰色 = 守护未安装。
+可视化层，不重复实现任何检查逻辑。菜单栏一个盾牌图标，颜色表示状态：绿色 = 代理正常，红色 = 未走代理，橙色 = 超过 90 秒没有新报告（守护可能没在跑），灰色 = 守护未安装。报告过期时面板判决变成「现状未知」并转橙，副标题写「报告 N 分钟前 · 上次确认：…」，与图标一致；故障原因同时改用过去时（「曾检测到…」）。
 
-点开是一个浮在菜单栏下方的面板（`NSPanel`，不抢焦点；再点盾牌关闭，应用在前台时 Esc 也可关闭）：
+点开是一个浮在菜单栏下方的面板（`NSPanel`，不抢焦点；再点盾牌关闭，应用在前台时 Esc 也可关闭）。面板跟随系统浅色/深色外观实时重绘，不缓存颜色快照；窗口高度受屏幕限制时，卡片主体可滚动，底部按钮栏固定可见，滚动条只在真正滚动时出现（见下）。整个界面只用 SF Symbols 图标（模板图像，随外观着色），没有位图素材：
 
-- 判定与覆盖方式（如 `TUN(utun1024)`）、报告距今多久、连续失败计数；
-- 八项检查的逐项结果：控制面、TUN 覆盖、系统代理、代理连通、规则审计、出口组、Claude 进程数、外部连接；
-- **IP 身份卡片**：IP、地区/邮编、坐标、运营商、时区与当地时间、系统时区（是否一致）、TZ 注入状态、遥测是否关闭、定位策略（设备定位从不读取），底部标注来源与更新时间；
-- 故障原因列表（只在不健康时出现）；
-- Claude 链进程清单（kind + pid + 命令行）；
-- “立即检查”实时跑一次 `guard.sh --status --json`（只读，不杀进程）；面板打开时每 10 秒自动刷新一次；
+- 顶部是一枚状态盾徽：绿色 `checkmark.shield.fill` = 代理正常，红色 `exclamationmark.shield.fill` = 未走代理，橙色 `clock.badge.exclamationmark` = 报告过期；旁边是判决、覆盖方式（如 `TUN(utun1024)`）、报告距今多久、连续失败计数，以及“刚刚实时检查”胶囊；
+- 八项检查的逐项结果：控制面、TUN 覆盖、系统代理、代理连通、规则审计、出口组、Claude 进程数、外部连接。每行左侧是状态灯：✓ 圆 = 通过，✗ 圆 = 失败（含「未验证按失败处理」），! 圆 = 降级/待确认，– 圆 = 不适用（如 TUN 未覆盖但系统代理已覆盖），ⓘ 圆 = 纯信息（进程数）；中间是分类图标，右侧是文字值（不带第二个图标；失败/告警项的值用语义色，通过项保持普通文字）；一条细线把“有没有覆盖”和“出口对不对”两组分开；
+- **IP 身份卡片**：IP、地区/邮编、坐标、运营商、时区与当地时间、系统时区（是否一致）、TZ 注入状态、遥测是否关闭、定位策略（设备定位从不读取），每行带字段图标，底部标注来源与更新时间；
+- 故障原因列表（只在不健康时出现，标题带警示图标；健康时整卡隐藏，不占位）；
+- Claude 链进程清单（kind + pid + 命令行，按 kinds 配 `macwindow` / `puzzlepiece.extension` / `terminal` / `arrow.left.arrow.right` 图标；名称列按最长 `kind pid` 实测定宽，命令行从左端截断、保留文件名；可见 4 行，更长的列表滚动，标题上注明“列表可滚动”；每行一个 VoiceOver 元素，读作“kind pid 命令”）；不健康时这张卡排在 IP 身份卡之前，因为“哪个进程在直连”才是当时要找的答案；
+- 底栏：“立即检查”是唯一的填色主按钮（强调色胶囊，回车键等效），旁边“刷新 IP 身份”“打开日志”“退出 ProxyGuard”三个无边框图标按钮（30pt 点击区，悬停提示与 VoiceOver 标签都是完整动作名）；右侧是“强制执行 / 仅观察”开关，带 `lock.shield` 图标，悬停说明开启后会杀 magpie / Claude 进程；
+- 面板永不成为 key window，所以主按钮的填充色是自绘的（`NSButton.bezelColor` 在这种面板里会被画成非活动灰），按钮本身仍是标准 `NSButton`，保留点击、键盘等效与无障碍语义；
+- “立即检查”实时跑一次 `guard.sh --status --json`（只读，不杀进程），期间按钮变成“检查中…”并换成循环箭头图标；面板打开时每 10 秒自动刷新一次；
 - “刷新 IP”立即跑一次 `geo.sh --force` 并刷新卡片；
-- “强制执行 / 仅观察”开关：改 `config.env` 的 `ENFORCE` 并用 `launchctl kickstart -k` 重启守护；关闭强制执行需在 4 秒内再点一次确认（不弹窗、不抢焦点）；
+- “强制执行 / 仅观察”开关：改 `config.env` 的 `ENFORCE` 并用 `launchctl kickstart -k` 重启守护；关闭强制执行需在 4 秒内再点一次确认（不弹窗、不抢焦点，提示出现在开关右侧）；
 - “日志”打开 `proxyguard.log`。
 
 命令行也能打开面板：`~/Applications/ProxyGuard.app/Contents/MacOS/ProxyGuard --show`（写一个触发文件，运行中的实例 0.5 秒内响应）。
@@ -275,7 +313,9 @@ bash build-app.sh        # 产物 dist/ProxyGuard.app
 bash install-app.sh      # 装到 ~/Applications 并启动
 ```
 
-两个无界面自检：`--selftest` 解码当前报告，`--selftest-ui` 离屏构建面板并排版一次。
+三个无界面自检：`--selftest` 解码当前报告；`--selftest-ui` 离屏构建面板并排版一次，检查底栏宽度、底栏是否始终在面板内、进程列表的可滚动范围，以及 AppKit 滚动条确已移除、滚动胶囊静止时隐藏且可点击穿透、在列表顶/底两端确实贴住可视区顶/底、刷新不误亮、停止滚动后自行消失；`--selftest-motion` 采样 Core Animation 的 presentation 值，检查入场缩放与顶边锚定、主按钮按下/回弹、退出淡出与退出途中重开的连续性（设置 `PROXYGUARD_REDUCE_MOTION=1` 时检查动效全部走瞬时路径）。
+
+动效只有三种：面板入场（220ms 从顶边向下展开 + 淡入，首次打开时头部与卡片按 40ms 错峰上浮）、主动作按下反馈（下沉到 0.965，80ms 按下 / 120ms 回弹）、状态变化的唯一提示（只在数值真的变化且面板可见时播放）；关闭比打开快（140ms，加速曲线），关闭途中再点盾牌会作废这次关闭并从当前透明度续播，不闪没。系统开启“减弱动态效果”时全部直接呈现最终状态。滚动条不是 AppKit 的：两个滚动视图都关掉了 `hasVerticalScroller`，右侧 3pt 胶囊只在内容偏移真的变化时淡入（打开面板而内容溢出时闪一下，之后停 1 秒淡出），静止时不占任何视觉空间，也不拦截点击；位置按可视区在文档中的比例计算，面板主体与进程列表的文档翻转方向不同，两种坐标空间都做了断言。
 
 ## 十二、卸载
 
@@ -289,6 +329,12 @@ bash uninstall.sh
 
 ```bash
 bash uninstall.sh --purge
+```
+
+`--purge` 会先执行 `identity.sh revert`（把 `~/.claude/settings.json` 从备份恢复、撤掉身份闸门）再删除目录；不带参数时保留目录，并提示闸门仍在 `~/.claude/settings.json` 里、如何单独撤销。只想撤闸门但保留守卫：
+
+```bash
+bash identity.sh revert
 ```
 
 只想临时停用而不卸载：

@@ -20,12 +20,15 @@ GUARD_NEW="$DEST/guard.sh.new.$$"
 GEO_PATH="$DEST/geo.sh"
 GEO_NEW="$DEST/geo.sh.new.$$"
 GEO_PREV="$DEST/geo.sh.prev"
+ID_PATH="$DEST/identity.sh"
+ID_NEW="$DEST/identity.sh.new.$$"
+ID_PREV="$DEST/identity.sh.prev"
 PLIST_PREV="$PLIST.prev"
 PLIST_NEW="$PLIST.new.$$"
 CONFIG_NEW=""
 
 cleanup() {
-  rm -f "$GUARD_NEW" "$GEO_NEW" "$PLIST_NEW" 2>/dev/null || true
+  rm -f "$GUARD_NEW" "$GEO_NEW" "$ID_NEW" "$PLIST_NEW" 2>/dev/null || true
   [ -n "$CONFIG_NEW" ] && rm -f "$CONFIG_NEW" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -68,6 +71,14 @@ chmod 755 "$GUARD_NEW"
 if [ -f "$SRC_DIR/geo.sh" ]; then
   cp "$SRC_DIR/geo.sh" "$GEO_NEW"
   chmod 755 "$GEO_NEW"
+fi
+if [ -f "$SRC_DIR/identity.sh" ]; then
+  if ! /bin/bash -n "$SRC_DIR/identity.sh" >/dev/null 2>&1; then
+    echo "ERROR: $SRC_DIR/identity.sh has a syntax error; refusing to install." >&2
+    exit 1
+  fi
+  cp "$SRC_DIR/identity.sh" "$ID_NEW"
+  chmod 755 "$ID_NEW"
 fi
 if [ ! -f "$DEST/config.env" ]; then
   CONFIG_NEW="$DEST/config.env.new.$$"
@@ -116,11 +127,15 @@ fi
 if [ -f "$GEO_PATH" ]; then
   cp -p "$GEO_PATH" "$GEO_PREV" 2>/dev/null || true
 fi
+if [ -f "$ID_PATH" ]; then
+  cp -p "$ID_PATH" "$ID_PREV" 2>/dev/null || true
+fi
 if [ -f "$PLIST" ]; then
   cp -p "$PLIST" "$PLIST_PREV" 2>/dev/null || true
 fi
 mv -f "$GUARD_NEW" "$GUARD_PATH"
 if [ -f "$GEO_NEW" ]; then mv -f "$GEO_NEW" "$GEO_PATH"; fi
+if [ -f "$ID_NEW" ]; then mv -f "$ID_NEW" "$ID_PATH"; fi
 if [ -n "$CONFIG_NEW" ]; then mv -f "$CONFIG_NEW" "$DEST/config.env"; fi
 mv -f "$PLIST_NEW" "$PLIST"
 
@@ -135,6 +150,7 @@ if ! launchctl bootstrap "gui/$UID_NUM" "$PLIST"; then
   else
     rm -f "$GEO_PATH"
   fi
+  if [ -f "$ID_PREV" ]; then mv -f "$ID_PREV" "$ID_PATH"; fi
   if [ -f "$PLIST_PREV" ]; then mv -f "$PLIST_PREV" "$PLIST"; fi
   launchctl bootstrap "gui/$UID_NUM" "$PLIST" 2>/dev/null || true
   echo "       The agent was NOT started. Run: /bin/bash $GUARD_PATH --check" >&2
@@ -148,3 +164,8 @@ echo "logs    : $HOME/Library/Logs/proxyguard.log"
 echo "config  : $DEST/config.env"
 echo "disable : ./uninstall.sh   (or set ENFORCE=0 in config.env)"
 echo "check   : /bin/bash $GUARD_PATH --check"
+if [ -f "$ID_PATH" ]; then
+  echo "identity: /bin/bash $ID_PATH status    (查看身份闸门)"
+  echo "          /bin/bash $ID_PATH apply     (写入 Claude Code 设置；会先备份)"
+  echo "          /bin/bash $ID_PATH verify    (seatbelt 对照实验，只读)"
+fi
