@@ -448,6 +448,31 @@ apply() {
   [ -f "$SETTINGS" ] || die "找不到 $SETTINGS"
   settings_target=$(resolve_symlinks "$SETTINGS")
   [ -n "$settings_target" ] || die "无法解析 $SETTINGS 的符号链接"
+
+  # 备份只在「第一次安装」时创建，之后一直保留，这样 `revert` 永远回到装闸门
+  # **之前**的状态。但备份也可能早就过期了：用户重写过 settings.json，旧备份
+  # 还留在原地。此时复用旧备份，等于把一份不含当前配置的文件记成「回滚点」，
+  # 以后 revert 会静默丢掉这期间新增/修改的一切。
+  #
+  # 判据不用 mtime（fs 复制、dotfiles 还原都会保留旧 mtime，不可靠）：当前
+  # settings.json 里**没有任何闸门痕迹**时，现有备份就不可能是「装闸门之前」的
+  # 那份快照，除非它与当前内容完全一致。这种情况把备份换成当前内容，旧备份
+  # 另存一份，绝不静默删除。
+  if [ -f "$BACKUP" ] && ! cmp -s "$BACKUP" "$settings_target" \
+     && ! jq -e '(.sandbox.filesystem.denyRead // [] | length) > 0
+                 or ((.permissions.deny // []) | any(startswith("Read(")))' \
+            "$settings_target" >/dev/null 2>&1; then
+    stale="$BACKUP.stale.$$"
+    keep="$BACKUP.prev.$(date +%Y%m%d%H%M%S)"
+    if cp -p "$settings_target" "$stale" \
+       && cp -p "$BACKUP" "$keep" \
+       && mv -f "$stale" "$BACKUP"; then
+      say "备份已更新为当前 settings.json；旧备份保留在 $keep"
+    else
+      rm -f "$stale" 2>/dev/null
+      die "无法更新过期的备份 $BACKUP；为免 revert 回到错误状态，未改动 settings.json"
+    fi
+  fi
   [ -f "$BACKUP" ] || cp -p "$settings_target" "$BACKUP" || die "备份失败"
 
   local deny_json read_json bash_json
